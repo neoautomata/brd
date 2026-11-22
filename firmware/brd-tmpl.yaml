@@ -513,6 +513,7 @@ script:
           cfg.wake_minute = ${wake_at_min};
           cfg.sleep_hour = ${sleep_at_hr};
           cfg.sleep_minute = ${sleep_at_min};
+          cfg.boundary_interval_min = ${short_sleep_time};
           cfg.fallback_sleep_sec = ${short_sleep_time} * 60;
 
           const auto plan = brd_schedule::plan_next_wake(cal, now_epoch, cfg);
@@ -701,6 +702,7 @@ script:
           cfg.wake_minute = ${wake_at_min};
           cfg.sleep_hour = ${sleep_at_hr};
           cfg.sleep_minute = ${sleep_at_min};
+          cfg.boundary_interval_min = ${short_sleep_time};
           cfg.fallback_sleep_sec = ${short_sleep_time} * 60;
 
           brd_schedule::SchedulePlan current_plan;

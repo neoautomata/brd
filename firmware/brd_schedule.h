@@ -245,8 +245,9 @@ inline SchedulePlan plan_next_wake(const CalendarPort &cal, int64_t now_epoch,
   if (now_sec >= wake_sec && now_sec < sleep_sec) {
     plan.mode = "timer";
 
-    // Find next quarter hour boundary with lead margin.
-    const int next_min = ((now_local.minute / cfg.boundary_interval_min) + 1) * cfg.boundary_interval_min;
+    // Find next interval boundary with lead margin.
+    const int interval_min = cfg.boundary_interval_min > 0 ? cfg.boundary_interval_min : 15;
+    const int next_min = ((now_local.minute / interval_min) + 1) * interval_min;
     WallTime cand = now_local;
     cand.second = 0;
     cand.minute = next_min % 60;
@@ -258,7 +259,7 @@ inline SchedulePlan plan_next_wake(const CalendarPort &cal, int64_t now_epoch,
     }
 
     if (cand_epoch - now_epoch < cfg.lead_margin_sec) {
-      cand.minute += cfg.boundary_interval_min;
+      cand.minute += interval_min;
       if (cand.minute >= 60) {
         cand.minute -= 60;
         cand.hour += 1;

@@ -277,6 +277,34 @@ static void test_schedule_dst_and_boundaries() {
   assert(cal.epoch_to_local(plan_fall.target_epoch, local_target));
   assert(local_target.hour == 14 && local_target.minute == 15 && local_target.second == 0);
 
+  // Test 5-minute boundary interval: 14:00:10 -> 14:05:00, and 14:03:10 skips to 14:10:00 due to 120s lead margin.
+  brd_schedule::ScheduleConfig cfg_5m = cfg;
+  cfg_5m.boundary_interval_min = 5;
+  cfg_5m.fallback_sleep_sec = 300;
+  int64_t epoch_5m_a = 0;
+  assert(cal.local_to_epoch({2026, 7, 15, 14, 0, 10}, epoch_5m_a));
+  auto plan_5m_a = brd_schedule::plan_next_wake(cal, epoch_5m_a, cfg_5m);
+  assert(plan_5m_a.clock_valid);
+  assert(plan_5m_a.arm_alarm);
+  assert(cal.epoch_to_local(plan_5m_a.target_epoch, local_target));
+  assert(local_target.hour == 14 && local_target.minute == 5 && local_target.second == 0);
+
+  int64_t epoch_5m_b = 0;
+  assert(cal.local_to_epoch({2026, 7, 15, 14, 3, 10}, epoch_5m_b));
+  auto plan_5m_b = brd_schedule::plan_next_wake(cal, epoch_5m_b, cfg_5m);
+  assert(plan_5m_b.clock_valid);
+  assert(plan_5m_b.arm_alarm);
+  assert(cal.epoch_to_local(plan_5m_b.target_epoch, local_target));
+  assert(local_target.hour == 14 && local_target.minute == 10 && local_target.second == 0);
+
+  // Non-positive boundary_interval_min falls back to 15-minute boundaries instead of dividing by zero.
+  brd_schedule::ScheduleConfig cfg_zero_int = cfg;
+  cfg_zero_int.boundary_interval_min = 0;
+  auto plan_zero_int = brd_schedule::plan_next_wake(cal, epoch_fall, cfg_zero_int);
+  assert(plan_zero_int.clock_valid);
+  assert(cal.epoch_to_local(plan_zero_int.target_epoch, local_target));
+  assert(local_target.hour == 14 && local_target.minute == 15 && local_target.second == 0);
+
   // Test Bedtime Clamping: 21:43:00 has mode "timer".
   brd_schedule::WallTime t_bed_clamp;
   t_bed_clamp.year = 2026;
