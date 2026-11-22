@@ -1,0 +1,355 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Edit {{ .dateHeader }} — BRD</title>
+	<script src="https://cdn.ckeditor.com/ckeditor5/36.0.1/super-build/ckeditor.js"></script>
+	<style>
+		:root {
+			--color-bg: #18181b;
+			--color-surface: #27272a;
+			--color-surface-hover: #3f3f46;
+			--color-border: #52525b;
+			--color-text: #f4f4f5;
+			--color-text-muted: #d4d4d8;
+			--color-primary-bg: #fafafa;
+			--color-primary-fg: #18181b;
+			--color-primary-hover: #e4e4e7;
+			--color-focus: #60a5fa;
+			--radius-sm: 6px;
+			--space-2: 8px;
+			--space-3: 12px;
+			--space-4: 16px;
+			--space-5: 20px;
+			--transition-fast: 150ms ease;
+		}
+
+		*, *::before, *::after {
+			box-sizing: border-box;
+		}
+
+		body {
+			margin: 0;
+			min-height: 100dvh;
+			background-color: var(--color-bg);
+			color: var(--color-text);
+			font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+			font-size: 16px;
+			line-height: 1.5;
+		}
+
+		.skip-link {
+			position: absolute;
+			left: -9999px;
+			top: var(--space-2);
+			z-index: 100;
+			padding: 10px 16px;
+			background: var(--color-primary-bg);
+			color: var(--color-primary-fg);
+			font-weight: 600;
+			text-decoration: none;
+			border-radius: var(--radius-sm);
+		}
+
+		.skip-link:focus-visible {
+			left: var(--space-2);
+			outline: 2px solid var(--color-focus);
+			outline-offset: 2px;
+		}
+
+		.shell {
+			width: 100%;
+			max-width: 572px;
+			margin: 0 auto;
+			padding: var(--space-4);
+			display: flex;
+			flex-direction: column;
+			gap: var(--space-4);
+		}
+
+		.topbar {
+			display: flex;
+			flex-direction: column;
+			gap: var(--space-3);
+		}
+
+		.editor-nav {
+			display: flex;
+			align-items: center;
+			justify-content: space-between;
+			gap: var(--space-3);
+		}
+
+		.page-title {
+			margin: 0;
+			font-size: 1.5rem;
+			font-weight: 700;
+			line-height: 1.2;
+		}
+
+		.page-subtitle {
+			margin: 0;
+			font-size: 1.125rem;
+			font-weight: 500;
+			color: var(--color-text-muted);
+		}
+
+		.editor-form {
+			display: flex;
+			flex-direction: column;
+			gap: var(--space-4);
+		}
+
+		.field-label {
+			display: block;
+			font-size: 0.9375rem;
+			font-weight: 600;
+			color: var(--color-text);
+		}
+
+		.editor-wrap {
+			width: 100%;
+			max-width: 540px;
+			color: #000000;
+		}
+
+		.editor-wrap .ck.ck-editor {
+			width: 100%;
+			max-width: 100%;
+		}
+
+		.ck-editor__editable_inline {
+			width: 100%;
+			max-width: 500px; /* 540 - 40 (2x margin) */
+			height: 665px; /* 960 - 40 (2x margin) - 74 (date) - 181 (weather) */
+			background-color: #ffffff;
+			color: #000000;
+			font-family: sans-serif;
+			font-size: 48px;
+		}
+
+		#editor {
+			width: 100%;
+			max-width: 500px;
+			height: 663px;
+			padding: var(--space-3);
+			font-family: sans-serif;
+			font-size: 1rem;
+			background-color: #ffffff;
+			color: #000000;
+			border: 1px solid var(--color-border);
+			border-radius: var(--radius-sm);
+		}
+
+		.form-actions {
+			display: flex;
+			flex-wrap: wrap;
+			align-items: center;
+			gap: var(--space-3);
+		}
+
+		.btn {
+			display: inline-flex;
+			align-items: center;
+			justify-content: center;
+			min-width: 44px;
+			min-height: 44px;
+			padding: 0 var(--space-5);
+			border-radius: var(--radius-sm);
+			font-family: inherit;
+			font-size: 1rem;
+			font-weight: 600;
+			text-decoration: none;
+			cursor: pointer;
+			touch-action: manipulation;
+			transition: background-color var(--transition-fast), border-color var(--transition-fast), opacity var(--transition-fast);
+		}
+
+		.btn-primary {
+			background-color: var(--color-primary-bg);
+			color: var(--color-primary-fg);
+			border: 1px solid var(--color-primary-bg);
+		}
+
+		.btn-primary:hover:not(:disabled) {
+			background-color: var(--color-primary-hover);
+		}
+
+		.btn-primary:disabled {
+			opacity: 0.55;
+			cursor: not-allowed;
+		}
+
+		.btn-secondary {
+			background-color: var(--color-surface);
+			color: var(--color-text);
+			border: 1px solid var(--color-border);
+		}
+
+		.btn-secondary:hover {
+			background-color: var(--color-surface-hover);
+		}
+
+		.btn:focus-visible,
+		#editor:focus-visible {
+			outline: 2px solid var(--color-focus);
+			outline-offset: 2px;
+		}
+
+		@media (prefers-reduced-motion: reduce) {
+			*, *::before, *::after {
+				transition-duration: 0.01ms !important;
+				animation-duration: 0.01ms !important;
+			}
+		}
+	</style>
+</head>
+<body>
+	<a class="skip-link" href="#main-content">Skip to editor</a>
+	<div class="shell">
+		<header class="topbar">
+			<nav class="editor-nav" aria-label="Editor navigation">
+				<a id="backlink" href="{{ .backURL }}" class="btn btn-secondary">Back</a>
+			</nav>
+			<h1 class="page-title">BRD</h1>
+			<h2 id="dateheader" class="page-subtitle">{{ .dateHeader }}</h2>
+		</header>
+
+		<main id="main-content">
+			<form id="edit-form" class="editor-form" action="/update" method="post">
+				<input type="hidden" name="date" id="date" value="{{ .dateStr }}">
+				<input type="hidden" name="csrf_token" value="{{ .csrfToken }}">
+				<label for="editor" class="field-label">Notes for {{ .dateHeader }}</label>
+				<div class="editor-wrap">
+					<textarea id="editor" name="contents">{{ .fileContent }}</textarea>
+				</div>
+				<div class="form-actions">
+					<button type="submit" id="save-btn" class="btn btn-primary">Save</button>
+					<a id="cancellink" href="{{ .backURL }}" class="btn btn-secondary">Cancel</a>
+				</div>
+			</form>
+		</main>
+	</div>
+
+	<script>
+		(function () {
+			const form = document.getElementById("edit-form");
+			const saveBtn = document.getElementById("save-btn");
+			let submitting = false;
+			form.addEventListener("submit", function (event) {
+				if (submitting) {
+					event.preventDefault();
+					return;
+				}
+				submitting = true;
+				saveBtn.disabled = true;
+				saveBtn.setAttribute("aria-busy", "true");
+				saveBtn.textContent = "Saving\u2026";
+			});
+		})();
+
+		if (window.CKEDITOR && CKEDITOR.ClassicEditor) {
+			CKEDITOR.ClassicEditor.create(document.getElementById("editor"), {
+				toolbar: {
+					items: [
+						'findAndReplace', 'selectAll', '|',
+						'heading', '|',
+						'bold', 'italic', 'strikethrough', 'underline', 'code', 'subscript', 'superscript', 'removeFormat', '|',
+						'bulletedList', 'numberedList', 'todoList', '|',
+						'outdent', 'indent', '|',
+						'undo', 'redo',
+						'-',
+						'fontSize', 'fontFamily', 'fontColor', 'fontBackgroundColor', 'highlight', '|',
+						'alignment', '|',
+						'link', 'insertImage', 'blockQuote', 'insertTable', 'mediaEmbed', 'codeBlock', 'htmlEmbed', '|',
+						'specialCharacters', 'horizontalLine', 'pageBreak', '|',
+						'sourceEditing'
+					],
+					shouldNotGroupWhenFull: true
+				},
+				list: {
+					properties: {
+						styles: true,
+						startIndex: true,
+						reversed: true
+					}
+				},
+				heading: {
+					options: [
+						{ model: 'paragraph', title: 'Paragraph', class: 'ck-heading_paragraph' },
+						{ model: 'heading1', view: 'h1', title: 'Heading 1', class: 'ck-heading_heading1' },
+						{ model: 'heading2', view: 'h2', title: 'Heading 2', class: 'ck-heading_heading2' },
+						{ model: 'heading3', view: 'h3', title: 'Heading 3', class: 'ck-heading_heading3' },
+						{ model: 'heading4', view: 'h4', title: 'Heading 4', class: 'ck-heading_heading4' }
+					]
+				},
+				placeholder: 'Enter notes for this day',
+				fontFamily: {
+					options: [
+						'default',
+						'sans-serif',
+						'Arial, Helvetica, sans-serif',
+						'Courier New, Courier, monospace',
+						'Georgia, serif',
+						'Lucida Sans Unicode, Lucida Grande, sans-serif',
+						'Tahoma, Geneva, sans-serif',
+						'Times New Roman, Times, serif',
+						'Trebuchet MS, Helvetica, sans-serif',
+						'Verdana, Geneva, sans-serif'
+					],
+					supportAllValues: true
+				},
+				fontSize: {
+					options: [ 28, 32, 36, 42, 'default', 54, 60, 66, 72 ],
+					supportAllValues: true
+				},
+				htmlSupport: {
+					allow: [
+						{
+							name: /.*/,
+							attributes: true,
+							classes: true,
+							styles: true
+						}
+					]
+				},
+				htmlEmbed: {
+					showPreviews: true
+				},
+				link: {
+					decorators: {
+						addTargetToExternalLinks: true,
+						defaultProtocol: 'https://',
+						toggleDownloadable: {
+							mode: 'manual',
+							label: 'Downloadable',
+							attributes: {
+								download: 'file'
+							}
+						}
+					}
+				},
+				removePlugins: [
+					'CKBox',
+					'CKFinder',
+					'EasyImage',
+					'RealTimeCollaborativeComments',
+					'RealTimeCollaborativeTrackChanges',
+					'RealTimeCollaborativeRevisionHistory',
+					'PresenceList',
+					'Comments',
+					'TrackChanges',
+					'TrackChangesData',
+					'RevisionHistory',
+					'Pagination',
+					'WProofreader',
+					'MathType'
+				]
+			}).catch(function (error) {
+				console.error(error);
+			});
+		}
+	</script>
+</body>
+</html>

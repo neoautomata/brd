@@ -1,0 +1,39 @@
+{
+  "data_dir": "/var/lib/brd",
+  "timezone": "Europe/Zurich",
+  "tailnet_hostname": "brd",
+  "tailnet_addr": ":80",
+  "local_addr": "127.0.0.1:1234",
+  "trust_webauth_header": true,
+  "trusted_proxy_tags": [],
+  "chromedriver_path": "/usr/bin/chromedriver",
+  "chromedriver_port": 4444,
+  "regen_interval_seconds": 300,
+  "retention_days": 7,
+  "admin_users": [
+    "papa@gmail.com"
+  ],
+  "editor_users": [
+    "mama@gmail.com"
+  ],
+  "calendars": [
+    "kid3@gmail.com",
+    "kid1@gmail.com",
+    "papa@gmail.com",
+    "kid2@gmail.com",
+    "family_cal_id@group.calendar.google.com",
+    "mama@gmail.com"
+  ],
+  "transit": {
+    "stationboard_url": "https://transport.opendata.ch/v1/stationboard?id=8591390&limit=30",
+    "cache_duration_seconds": 600,
+    "excluded_stop_id": "8503023",
+    "excluded_stop_name": "Zürich, Heuried",
+    "lines": [
+      "9",
+      "14"
+    ],
+    "max_departures": 4
+  },
+  "weather_widget_html": "<div id=\"ww_2315453e4f5da\" v='1.3' style=\"margin: auto; display: inline-block; min-width: 100%; max-width: 100%;\" loc='id' a='{\"t\":\"horizontal\",\"lang\":\"en\",\"sl_lpl\":1,\"ids\":[\"wl8349\"],\"font\":\"Arial\",\"sl_ics\":\"one\",\"sl_sot\":\"celsius\",\"cl_bkg\":\"rgba(255,255,255,1)\",\"cl_font\":\"#000000\",\"cl_cloud\":\"#000000\",\"cl_persp\":\"#000000\",\"cl_sun\":\"#000000\",\"cl_moon\":\"#000000\",\"cl_thund\":\"#000000\",\"el_nme\":3}'>Weather for the Following Location: <a href=\"https://2ua.org/de/che/zürich/karte/\" id=\"ww_2315453e4f5da_u\" target=\"_blank\">Zürich, Schweiz</a></div><script async src=\"https://app1.weatherwidget.org/js/?id=ww_2315453e4f5da\"></script>"
+}

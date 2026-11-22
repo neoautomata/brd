@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>BRD — {{ .dateHeader }}</title>
+	<link rel="stylesheet" href="/ckengine5.css">
+	<style>
+		:root {
+			--color-bg: #18181b;
+			--color-surface: #27272a;
+			--color-surface-hover: #3f3f46;
+			--color-border: #52525b;
+			--color-text: #f4f4f5;
+			--color-text-muted: #d4d4d8;
+			--color-primary-bg: #fafafa;
+			--color-primary-fg: #18181b;
+			--color-primary-hover: #e4e4e7;
+			--color-link: #93c5fd;
+			--color-focus: #60a5fa;
+			--radius-sm: 6px;
+			--space-2: 8px;
+			--space-3: 12px;
+			--space-4: 16px;
+			--space-5: 20px;
+			--transition-fast: 150ms ease;
+		}
+
+		*, *::before, *::after {
+			box-sizing: border-box;
+		}
+
+		body {
+			margin: 0;
+			min-height: 100dvh;
+			background-color: var(--color-bg);
+			color: var(--color-text);
+			font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+			font-size: 16px;
+			line-height: 1.5;
+		}
+
+		.skip-link {
+			position: absolute;
+			left: -9999px;
+			top: var(--space-2);
+			z-index: 100;
+			padding: 10px 16px;
+			background: var(--color-primary-bg);
+			color: var(--color-primary-fg);
+			font-weight: 600;
+			text-decoration: none;
+			border-radius: var(--radius-sm);
+		}
+
+		.skip-link:focus-visible {
+			left: var(--space-2);
+			outline: 2px solid var(--color-focus);
+			outline-offset: 2px;
+		}
+
+		.shell {
+			display: flex;
+			flex-direction: column;
+			align-items: center;
+			gap: var(--space-4);
+			padding: var(--space-4) var(--space-3) var(--space-5);
+			width: 100%;
+		}
+
+		.topbar {
+			width: 100%;
+			max-width: 540px;
+		}
+
+		.day-nav {
+			display: grid;
+			grid-template-columns: 1fr auto 1fr;
+			align-items: center;
+			gap: var(--space-3);
+			width: 100%;
+		}
+
+		.nav-slot-left {
+			display: flex;
+			justify-content: flex-start;
+		}
+
+		.nav-slot-center {
+			display: flex;
+			justify-content: center;
+		}
+
+		.nav-slot-right {
+			display: flex;
+			justify-content: flex-end;
+		}
+
+		.btn {
+			display: inline-flex;
+			align-items: center;
+			justify-content: center;
+			min-width: 44px;
+			min-height: 44px;
+			padding: 0 var(--space-4);
+			border-radius: var(--radius-sm);
+			font-size: 1rem;
+			font-weight: 600;
+			text-decoration: none;
+			cursor: pointer;
+			touch-action: manipulation;
+			transition: background-color var(--transition-fast), border-color var(--transition-fast);
+		}
+
+		.btn-primary {
+			background-color: var(--color-primary-bg);
+			color: var(--color-primary-fg);
+			border: 1px solid var(--color-primary-bg);
+		}
+
+		.btn-primary:hover {
+			background-color: var(--color-primary-hover);
+		}
+
+		.btn-secondary {
+			background-color: var(--color-surface);
+			color: var(--color-text);
+			border: 1px solid var(--color-border);
+		}
+
+		.btn-secondary:hover {
+			background-color: var(--color-surface-hover);
+		}
+
+		.btn:focus-visible,
+		.footer-link:focus-visible {
+			outline: 2px solid var(--color-focus);
+			outline-offset: 2px;
+		}
+
+		.canvas-main {
+			width: 100%;
+		}
+
+		.canvas-stage {
+			width: 100%;
+			overflow-x: auto;
+			-webkit-overflow-scrolling: touch;
+		}
+
+		.canvas-frame {
+			width: 540px;
+			margin: 0 auto;
+		}
+
+		.status-footer {
+			width: 100%;
+			max-width: 540px;
+			display: flex;
+			flex-direction: column;
+			align-items: center;
+			gap: var(--space-2);
+			text-align: center;
+			color: var(--color-text-muted);
+			font-size: 0.9375rem;
+		}
+
+		.status-line {
+			margin: 0;
+			overflow-wrap: anywhere;
+		}
+
+		.footer-link {
+			display: inline-flex;
+			align-items: center;
+			justify-content: center;
+			min-width: 44px;
+			min-height: 44px;
+			padding: 0 var(--space-3);
+			color: var(--color-link);
+			font-weight: 600;
+			text-decoration: underline;
+			text-underline-offset: 3px;
+			border-radius: var(--radius-sm);
+			touch-action: manipulation;
+		}
+
+		/* E-ink weather widget and transit chip rules inside #screenshot_content. */
+		#ww_2315453e4f5da .ww_arr_left, #ww_2315453e4f5da .ww_arr_right {
+			display: none;
+		}
+		#ww_2315453e4f5da .ww_wind, #ww_2315453e4f5da .ww_humidity, #ww_2315453e4f5da .ww_pressure {
+			font-size: 28px;
+		}
+		#ww_2315453e4f5da div.ww_delimiter {
+			margin-top: 2px;
+			margin-bottom: 2px;
+		}
+		#ww_2315453e4f5da div.ww_hour {
+			margin-right: 0;
+			font-size: 18px;
+		}
+		#ww_2315453e4f5da div.ww_hour_date {
+			font-size: 100%;
+			opacity: 1;
+			margin-bottom: 0;
+		}
+		#ww_2315453e4f5da {
+			font-weight: bold;
+		}
+		#ww_2315453e4f5da .ww_cond {
+			font-size: 20px;
+		}
+		#ww_2315453e4f5da div.ww-box {
+			padding: 0;
+		}
+		#ww_2315453e4f5da div.ww_line {
+			margin: 0;
+		}
+
+		.chip-dark {
+			display: inline-flex;
+			align-items: center;
+			background-color: #000000;
+			color: #ffffff;
+			font-weight: 600;
+			padding: 4px 10px;
+			border-radius: 5px;
+			line-height: 1;
+		}
+
+		@media (prefers-reduced-motion: reduce) {
+			*, *::before, *::after {
+				transition-duration: 0.01ms !important;
+				animation-duration: 0.01ms !important;
+			}
+		}
+	</style>
+</head>
+<body>
+	<a class="skip-link" href="#main-content">Skip to content</a>
+	<div class="shell">
+		<header class="topbar">
+			<nav class="day-nav" aria-label="Day navigation">
+				<div class="nav-slot-left">
+					{{ if .showPrev }}<a href="{{ .prevURL }}" id="prevdaylink" class="btn btn-secondary">Prev</a>{{ end }}
+				</div>
+				<div class="nav-slot-center">
+					<a id="editlink" href="{{ .editURL }}" class="btn btn-primary">Edit</a>
+				</div>
+				<div class="nav-slot-right">
+					<a id="nextdaylink" href="{{ .nextURL }}" class="btn btn-secondary">Next</a>
+				</div>
+			</nav>
+		</header>
+
+		<main id="main-content" class="canvas-main">
+			<div class="canvas-stage">
+				<div class="canvas-frame">
+					<!-- screen is y=960 x=540 or 103.7 mm × 58.3 mm -->
+					<div id="screenshot_content" class="ck-content" style="position: relative; background-color: #fff; color: #000; font-family: sans-serif; font-size: 48px; line-height: normal; min-height: 960px; height: 960px; max-height: 960px; min-width: 540px; width: 540px; max-width: 540px; margin: 0 auto; padding: 10px; box-sizing: border-box; display: flex; flex-direction: column; align-items: center;">
+						<h1 style="text-align: center; margin: 0px; font-size: 64px;">{{ .dateHeader }}</h1>
+						{{ .weatherWidgetHTML }}
+						<div style="flex: 1 1 auto; width: 100%; display: flex; flex-direction: column; align-items: center; overflow: hidden; margin-bottom: 10px;">
+							{{ .calData }}{{ .fileContent }}
+						</div>
+						{{ if .transitLines }}
+						<div style="flex-shrink: 0; z-index: 10; font-size: 32px; width: max-content; white-space: nowrap; text-align: center;">
+							{{ range $i, $line := .transitLines }}
+							<div{{ if eq $i 0 }} style="padding-bottom: 5px;"{{ end }}><span class="chip-dark">{{ $line.Line }}</span> {{ $line.Next }}</div>
+							{{ end }}
+						</div>
+						{{ end }}
+					</div>
+				</div>
+			</div>
+		</main>
+
+		<footer class="status-footer">
+			<p class="status-line">Access token expires: {{ .tokenExpiry }}</p>
+			<p class="status-line"><a href="/newtoken" class="footer-link">Full refresh</a> (last {{ .lastFullRefresh }}; elapsed {{ .fullRefreshElapsed }})</p>
+		</footer>
+	</div>
+</body>
+</html>

@@ -1,0 +1,770 @@
+defaults:
+  name: brd
+  brd_dir: brd/firmware
+  short_sleep_time: 15
+  sleep_at_hr: 22
+  sleep_at_min: 0
+  wake_at_hr: 7
+  wake_at_min: 0
+  min_awake_sec: 30
+  periodic_refresh_after_sec: 300
+  wifi_connect_timeout_sec: 90
+  rtc_i2c_addr: 0x51
+  wifi_output_power: 12.0
+  local_timezone: UTC
+  image_url_raw: ""
+  image_url_raw_sha: ""
+  vlogs_host: ""
+  vmetrics_host: ""
+
+packages:
+  lilygo_t5_47_plus: github://hbast/lilygo_t5_47_plus/packages/lilygo_t5_47_plus.yaml@v1.0.0
+
+esphome:
+  name: ${name}
+  min_version: 2026.3.0
+  includes:
+    - ${brd_dir}/brd_blit.h
+    - ${brd_dir}/brd_schedule.h
+    - ${brd_dir}/brd_rtc.h
+    - ${brd_dir}/brd_power.h
+  platformio_options:
+    board_build.f_flash: 80000000L
+    board_build.f_cpu: 240000000L
+  on_shutdown:
+    - priority: -100.0
+      then:
+        - lambda: |-
+            if (brd_power::entering_deep_sleep) {
+              brd_power::lock_epd_and_holds_for_deep_sleep();
+            }
+  on_boot:
+    - priority: 900.0
+      then:
+        - lambda: |-
+            esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
+            uint64_t wakeup_pin_mask = 0;
+            if (wakeup_reason == ESP_SLEEP_WAKEUP_EXT1) {
+              wakeup_pin_mask = esp_sleep_get_ext1_wakeup_status();
+            }
+            int cause_code = 0;
+            if (wakeup_reason == ESP_SLEEP_WAKEUP_EXT1) {
+              cause_code = 3;
+            } else if (wakeup_reason == ESP_SLEEP_WAKEUP_TIMER) {
+              cause_code = 4;
+            }
+            id(boot_wakeup_cause) = cause_code;
+            id(boot_ext1_mask) = wakeup_pin_mask;
+
+            // Register latch component and release sleep holds.
+            brd_power::register_power_latch();
+            brd_power::release_sleep_holds_on_boot();
+            brd_power::rtc_state.validate_or_reset();
+            id(boot_prev_slept) = brd_power::rtc_state.prev_slept;
+            brd_power::rtc_state.boot_count++;
+            brd_power::rtc_state.update_crc();
+    - priority: 250.0
+      then:
+        - lambda: |-
+            // Clear status flags on hardware RTC and disable clock output.
+            brd_rtc::EspHomeI2cAdapter i2c_bus(id(lilygo_t5_47_plus_i2c));
+            brd_rtc::RtcStatus rtc_status;
+            brd_rtc::read_and_clear_status_and_disable_clkout(i2c_bus, ${rtc_i2c_addr}, rtc_status);
+            id(rtc_time).read_time();
+
+            const char *classified_reason = brd_power::classify_wake_reason(
+                id(boot_wakeup_cause), id(boot_ext1_mask), rtc_status.alarm_flag, rtc_status.timer_flag);
+            id(wake_reason).publish_state(classified_reason);
+
+            id(is_button_wake) = (id(boot_wakeup_cause) == 3 && (id(boot_ext1_mask) & (1ULL << 21)));
+            id(is_touch_wake) = (id(boot_wakeup_cause) == 3 &&
+                                 ((id(boot_ext1_mask) & (1ULL << 10)) || (id(boot_ext1_mask) & (1ULL << 47))));
+            id(is_rtc_wake) = (strcmp(classified_reason, "Ext_RTC") == 0 ||
+                               strcmp(classified_reason, "Int_RTC") == 0);
+
+            if (!id(is_touch_wake)) {
+              id(wake_touch_x) = -1;
+              id(wake_touch_y) = -1;
+            }
+
+            brd_power::rtc_state.staying_awake_usb = brd_power::check_usb_sof_incremented();
+            brd_power::rtc_state.update_crc();
+
+            if (brd_power::rtc_state.staying_awake_usb) {
+              ESP_LOGI("power", "USB power is active. Keeping device awake.");
+            }
+        - script.execute: sleep_watchdog
+    - priority: 200.0
+      then:
+        - script.execute: sample_batt
+
+globals:
+  - id: boot_wakeup_cause
+    type: int
+    initial_value: '0'
+  - id: boot_ext1_mask
+    type: uint64_t
+    initial_value: '0'
+  - id: boot_prev_slept
+    type: bool
+    initial_value: 'false'
+  - id: next_wake_is_overnight
+    type: bool
+    initial_value: 'false'
+  - id: image_download_complete
+    type: bool
+    initial_value: 'false'
+  - id: image_is_new
+    type: bool
+    initial_value: 'false'
+  - id: image_failed
+    type: bool
+    initial_value: 'false'
+  - id: forced_refresh
+    type: bool
+    initial_value: 'false'
+  - id: wake_touch_x
+    type: int
+    initial_value: '-1'
+  - id: wake_touch_y
+    type: int
+    initial_value: '-1'
+  - id: is_button_wake
+    type: bool
+    initial_value: 'false'
+  - id: is_touch_wake
+    type: bool
+    initial_value: 'false'
+  - id: is_rtc_wake
+    type: bool
+    initial_value: 'false'
+  - id: next_wake_epoch
+    type: uint32_t
+    initial_value: '0'
+  - id: next_wake_alarm
+    type: bool
+    initial_value: 'false'
+  - id: sleep_seconds
+    type: uint32_t
+    initial_value: '0'
+
+wifi:
+  fast_connect: true
+  power_save_mode: light
+  output_power: ${wifi_output_power}
+  on_connect:
+    - lambda: |-
+        id(image_download_complete) = false;
+        id(image_failed) = false;
+    - script.execute: sample_batt
+    - lambda: |-
+        const uint32_t current_mv = brd_power::voltage_to_mv(id(batt_voltage).state);
+        const bool sof_inc = brd_power::check_usb_sof_incremented();
+        brd_power::rtc_state.staying_awake_usb = brd_power::evaluate_usb_power(
+            current_mv, brd_power::rtc_state.prev_batt_mv, brd_power::rtc_state.staying_awake_usb,
+            sof_inc, id(boot_prev_slept));
+        brd_power::rtc_state.update_crc();
+        if (brd_power::rtc_state.staying_awake_usb) {
+          ESP_LOGI("power", "USB power is active. Keeping device awake.");
+        }
+    - component.update: rtc_time
+    - lambda: |-
+        // Sync network time when the hardware RTC clock is invalid or stale.
+        auto rtc_now = id(rtc_time).now();
+        const uint32_t current_epoch = rtc_now.is_valid() ? rtc_now.timestamp : 0;
+        const bool expired = (brd_power::rtc_state.last_rtc_sync_epoch == 0) ||
+                             (current_epoch > brd_power::rtc_state.last_rtc_sync_epoch &&
+                              (current_epoch - brd_power::rtc_state.last_rtc_sync_epoch) >= 21600);
+        if (!rtc_now.is_valid() || expired) {
+          ESP_LOGI("time", "The firmware requests an SNTP time update.");
+          if (esp_sntp_enabled()) {
+            esp_sntp_restart();
+          }
+        } else {
+          ESP_LOGI("time", "The hardware RTC is current. Skipping SNTP update.");
+        }
+    - if:
+        condition:
+          lambda: 'return !id(rtc_time).now().is_valid();'
+        then:
+          - wait_until:
+              condition:
+                lambda: 'return id(ntp_time).now().is_valid();'
+              timeout: 5s
+    - script.execute: plan_next_wake
+    - script.execute: brd_image_task
+    - wait_until:
+        condition:
+          lambda: 'return id(image_download_complete);'
+        timeout: 30s
+    - logger.log: "The firmware completed image processing."
+    - script.execute: enter_sleep
+
+logger:
+  hardware_uart: USB_SERIAL_JTAG
+
+http_request:
+  id: http_client
+  useragent: "ESPHome-${name}"
+  timeout: 10s
+
+button:
+  - platform: restart
+    name: "Restart"
+
+  - platform: template
+    name: "Refresh"
+    icon: "mdi:update"
+    on_press:
+      then:
+        - lambda: 'id(forced_refresh) = true;'
+        - script.execute: brd_image_task
+
+binary_sensor:
+  - platform: template
+    name: "Image Refreshed"
+    id: image_refreshed
+    device_class: occupancy
+
+text_sensor:
+  - platform: template
+    name: "Wake Reason"
+    id: wake_reason
+    icon: "mdi:power-sleep"
+
+sensor:
+  - platform: template
+    name: "Battery Voltage"
+    id: batt_voltage
+    unit_of_measurement: "V"
+    accuracy_decimals: 2
+    device_class: "voltage"
+    state_class: "measurement"
+    update_interval: never
+
+  - platform: template
+    name: "Battery Level"
+    id: batt_level
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    device_class: "battery"
+    state_class: "measurement"
+    update_interval: never
+
+  - platform: template
+    name: "Wake Touch X"
+    id: wake_touch_x_sensor
+    unit_of_measurement: "px"
+
+  - platform: template
+    name: "Wake Touch Y"
+    id: wake_touch_y_sensor
+    unit_of_measurement: "px"
+
+  - platform: template
+    name: "Awake Duration"
+    id: awake_duration_sensor
+    unit_of_measurement: "s"
+    accuracy_decimals: 1
+    device_class: duration
+
+time:
+  - platform: pcf8563
+    id: rtc_time
+    timezone: ${local_timezone}
+    i2c_id: lilygo_t5_47_plus_i2c
+    address: ${rtc_i2c_addr}
+
+  - platform: sntp
+    id: ntp_time
+    timezone: ${local_timezone}
+    servers:
+      - 0.pool.ntp.org
+      - 1.pool.ntp.org
+      - 2.pool.ntp.org
+    on_time_sync:
+      then:
+        - lambda: |-
+            // Write network time to the hardware RTC.
+            auto ntp_now = id(ntp_time).now();
+            if (ntp_now.is_valid()) {
+              brd_rtc::EspHomeI2cAdapter i2c_bus(id(lilygo_t5_47_plus_i2c));
+              brd_rtc::UtcClock clk;
+              time_t ts = ntp_now.timestamp;
+              struct tm tm_buf;
+              if (gmtime_r(&ts, &tm_buf) != nullptr) {
+                clk.year = tm_buf.tm_year + 1900;
+                clk.month = tm_buf.tm_mon + 1;
+                clk.day = tm_buf.tm_mday;
+                clk.weekday = static_cast<uint8_t>(tm_buf.tm_wday + 1);
+                clk.hour = tm_buf.tm_hour;
+                clk.minute = tm_buf.tm_min;
+                clk.second = tm_buf.tm_sec;
+                brd_rtc::write_utc_clock_only(i2c_bus, ${rtc_i2c_addr}, clk);
+                brd_power::rtc_state.last_rtc_sync_epoch = ntp_now.timestamp;
+                brd_power::rtc_state.update_crc();
+                if (!id(rtc_time).now().is_valid()) {
+                  id(rtc_time).read_time();
+                }
+                ESP_LOGI("time", "The firmware saved network time to the hardware RTC.");
+              }
+            }
+
+deep_sleep:
+  id: deep_sleep_1
+  esp32_ext1_wakeup:
+    mode: ANY_LOW
+    pins:
+      - GPIO21
+      - GPIO09
+
+interval:
+  - interval: 10s
+    then:
+      - if:
+          condition:
+            lambda: 'return brd_power::rtc_state.staying_awake_usb;'
+          then:
+            - script.execute: sample_batt
+            - lambda: |-
+                const uint32_t batt_mv = brd_power::voltage_to_mv(id(batt_voltage).state);
+                const bool sof_inc = brd_power::check_usb_sof_incremented();
+                const bool still_awake = brd_power::evaluate_usb_power(
+                    batt_mv, brd_power::rtc_state.prev_batt_mv, true, sof_inc, id(boot_prev_slept));
+                if (!still_awake) {
+                  brd_power::rtc_state.staying_awake_usb = false;
+                  brd_power::rtc_state.update_crc();
+                  ESP_LOGI("power", "USB power disconnected. Preparing sleep sequence.");
+                }
+            - if:
+                condition:
+                  and:
+                    - lambda: 'return id(image_download_complete);'
+                    - lambda: 'return !brd_power::rtc_state.staying_awake_usb;'
+                then:
+                  - script.execute: plan_next_wake
+                  - script.execute: enter_sleep
+
+  - interval: 5min
+    then:
+      - if:
+          condition:
+            and:
+              - lambda: 'return millis() >= ${periodic_refresh_after_sec} * 1000;'
+              - wifi.connected:
+              - lambda: 'return brd_power::rtc_state.staying_awake_usb;'
+          then:
+            - logger.log: "Starting periodic refresh on USB power."
+            - script.execute: brd_image_task
+
+script:
+  - id: sample_batt
+    mode: single
+    then:
+      - lambda: |-
+          const float v = brd_power::sample_battery_rails_only();
+          if (std::isfinite(v)) {
+            id(batt_voltage).publish_state(v);
+            const float pct = brd_power::battery_voltage_to_percent(v);
+            id(batt_level).publish_state(pct);
+          } else {
+            ESP_LOGW("batt", "The firmware skipped battery sampling or read an invalid value.");
+          }
+
+  - id: brd_image_task
+    mode: single
+    then:
+      - logger.log: "The firmware checks the image version."
+      - lambda: |-
+          id(image_is_new) = false;
+          id(image_failed) = false;
+
+          if (std::strlen("${image_url_raw_sha}") == 0 || std::strlen("${image_url_raw}") == 0) {
+            id(image_failed) = true;
+            ESP_LOGE("main", "Image URLs are not configured.");
+            return;
+          }
+
+          auto sha_container = id(http_client).get("${image_url_raw_sha}");
+          if (sha_container == nullptr) {
+            id(image_failed) = true;
+            ESP_LOGE("main", "HTTP GET failed for ${image_url_raw_sha}");
+            return;
+          }
+          if (sha_container->status_code != 200) {
+            id(image_failed) = true;
+            ESP_LOGE("main", "Image version check failed with HTTP status %d", sha_container->status_code);
+            sha_container->end();
+            return;
+          }
+
+          char hash_buf[80];
+          size_t hash_len = 0;
+          {
+            uint32_t last_data = millis();
+            const uint32_t timeout = id(http_client).get_timeout();
+            while (hash_len < sizeof(hash_buf) - 1) {
+              int n = sha_container->read((uint8_t *) hash_buf + hash_len, sizeof(hash_buf) - 1 - hash_len);
+              if (n > 0) {
+                hash_len += static_cast<size_t>(n);
+                last_data = millis();
+                continue;
+              }
+              if (n < 0 || sha_container->is_read_complete() || (millis() - last_data > timeout)) {
+                break;
+              }
+              delay(1);
+              App.feed_wdt();
+            }
+          }
+          sha_container->end();
+
+          char normalized_sha[65];
+          if (!brd_blit::parse_and_normalize_sha256(hash_buf, hash_len, normalized_sha)) {
+            id(image_failed) = true;
+            ESP_LOGE("main", "The server sent an invalid SHA-256 digest.");
+            return;
+          }
+
+          // Compare with saved digest unless user requested a manual refresh.
+          if (!id(forced_refresh) && strcmp(normalized_sha, brd_power::rtc_state.last_img_hash) == 0) {
+            ESP_LOGI("main", "Image %s is unchanged. Skipping display refresh.", normalized_sha);
+            id(image_is_new) = false;
+            id(image_refreshed).publish_state(false);
+            return;
+          }
+
+          auto img_container = id(http_client).get("${image_url_raw}");
+          if (img_container == nullptr) {
+            id(image_failed) = true;
+            ESP_LOGE("main", "HTTP GET failed for ${image_url_raw}");
+            return;
+          }
+          if (img_container->status_code != 200) {
+            id(image_failed) = true;
+            ESP_LOGE("main", "Image download failed with HTTP status %d", img_container->status_code);
+            img_container->end();
+            return;
+          }
+
+          uint8_t *dst = brd_blit::framebuffer(id(t5_display));
+          const size_t expected = brd_blit::framebuffer_size(id(t5_display));
+          if (dst == nullptr || expected != brd_blit::FRAMEBUFFER_SIZE) {
+            id(image_failed) = true;
+            ESP_LOGE("main", "Display framebuffer is invalid (%u bytes)", (unsigned) expected);
+            img_container->end();
+            return;
+          }
+          const auto read_res = http_request::http_read_fully(
+              img_container.get(), dst, expected, 4096, id(http_client).get_timeout());
+          const size_t got = img_container->get_bytes_read();
+          img_container->end();
+
+          if (read_res.status != http_request::HttpReadStatus::OK || got != expected) {
+            id(image_failed) = true;
+            ESP_LOGE("main", "Image download ended early: read %u of %u bytes (status %d)",
+                     (unsigned) got, (unsigned) expected, (int) read_res.status);
+            return;
+          }
+
+          strncpy(brd_power::rtc_state.last_img_hash, normalized_sha, sizeof(brd_power::rtc_state.last_img_hash));
+          brd_power::rtc_state.update_crc();
+          id(image_is_new) = true;
+          id(forced_refresh) = false;
+          id(image_refreshed).publish_state(true);
+          ESP_LOGI("main", "The firmware loaded %u bytes into the display buffer.", (unsigned) got);
+      - if:
+          condition:
+            lambda: 'return id(image_is_new);'
+          then:
+            - lambda: |-
+                esp_wifi_set_ps(WIFI_PS_MAX_MODEM);
+                brd_power::epd_refresh_active = true;
+            - component.update: t5_display
+            - lambda: |-
+                esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+                brd_power::epd_refresh_active = false;
+                brd_power::poweroff_epd_rails_idle();
+      - script.execute: report_run
+      - lambda: 'id(image_download_complete) = true;'
+
+  - id: plan_next_wake
+    then:
+      - lambda: |-
+          id(next_wake_epoch) = 0;
+          id(next_wake_alarm) = false;
+          id(sleep_seconds) = ${short_sleep_time} * 60;
+          id(next_wake_is_overnight) = false;
+
+          if (brd_power::rtc_state.staying_awake_usb) {
+            ESP_LOGI("sleep", "USB power is active. Skipping deep sleep.");
+            return;
+          }
+
+          auto local_time = id(ntp_time).now();
+          if (!local_time.is_valid()) {
+            local_time = id(rtc_time).now();
+          }
+
+          const int64_t now_epoch = local_time.is_valid() ? local_time.timestamp : 0;
+          brd_schedule::EspHomeTzCalendar cal;
+          brd_schedule::ScheduleConfig cfg;
+          cfg.wake_hour = ${wake_at_hr};
+          cfg.wake_minute = ${wake_at_min};
+          cfg.sleep_hour = ${sleep_at_hr};
+          cfg.sleep_minute = ${sleep_at_min};
+          cfg.fallback_sleep_sec = ${short_sleep_time} * 60;
+
+          const auto plan = brd_schedule::plan_next_wake(cal, now_epoch, cfg);
+          id(next_wake_epoch) = plan.target_epoch;
+          id(next_wake_alarm) = plan.arm_alarm;
+          id(sleep_seconds) = plan.sleep_seconds;
+          id(next_wake_is_overnight) = (strcmp(plan.mode, "alarm") == 0);
+
+          ESP_LOGI("sleep", "Plan: mode=%s epoch=%" PRId64 " sleep_s=%" PRIu32 " arm_alarm=%d",
+                   plan.mode, plan.target_epoch, plan.sleep_seconds, plan.arm_alarm ? 1 : 0);
+
+  - id: report_run
+    then:
+      - lambda: |-
+          auto now_local = id(ntp_time).now();
+          if (!now_local.is_valid()) {
+            now_local = id(rtc_time).now();
+          }
+
+          char now_buf[32];
+          if (now_local.is_valid()) {
+            now_local.strftime(now_buf, sizeof(now_buf), "%Y-%m-%dT%H:%M:%S%z");
+          } else {
+            snprintf(now_buf, sizeof(now_buf), "unknown");
+          }
+
+          const char *mode = "none";
+          char next_buf[32];
+          char next_in_buf[12];
+          if (id(next_wake_epoch) != 0) {
+            mode = id(next_wake_is_overnight) ? "alarm" : "timer";
+            ESPTime next_local = ESPTime::from_epoch_local(id(next_wake_epoch));
+            next_local.strftime(next_buf, sizeof(next_buf), "%Y-%m-%dT%H:%M:%S%z");
+
+            if (now_local.is_valid()) {
+              snprintf(next_in_buf, sizeof(next_in_buf), "%d",
+                       (int) id(next_wake_epoch) - (int) now_local.timestamp);
+            } else {
+              snprintf(next_in_buf, sizeof(next_in_buf), "unknown");
+            }
+          } else {
+            snprintf(next_buf, sizeof(next_buf), "unknown");
+            snprintf(next_in_buf, sizeof(next_in_buf), "unknown");
+          }
+
+          const uint32_t now_epoch = now_local.is_valid() ? static_cast<uint32_t>(now_local.timestamp) : 0;
+          char since_buf[16];
+          long since_num = -1;
+          if (now_epoch != 0 && brd_power::rtc_state.prev_trace_epoch != 0 &&
+              now_epoch > brd_power::rtc_state.prev_trace_epoch) {
+            since_num = static_cast<long>(now_epoch - brd_power::rtc_state.prev_trace_epoch);
+            snprintf(since_buf, sizeof(since_buf), "%ld", since_num);
+          } else {
+            snprintf(since_buf, sizeof(since_buf), "unknown");
+          }
+
+          brd_power::TraceTelemetry telem;
+          telem.wake_reason = id(wake_reason).state.empty() ? "unknown" : id(wake_reason).state.c_str();
+          telem.mode = mode;
+          telem.batt_v = id(batt_voltage).state;
+          telem.batt_pct = id(batt_level).state;
+          telem.awake_s = millis() / 1000.0f;
+          telem.image_status = id(image_failed) ? "failed" : (id(image_is_new) ? "new" : "cached");
+          telem.touch_x = id(wake_touch_x);
+          telem.touch_y = id(wake_touch_y);
+          telem.now_str = now_buf;
+          telem.next_str = next_buf;
+          telem.next_in_str = next_in_buf;
+          telem.since_str = since_buf;
+          telem.prev_slept = brd_power::rtc_state.prev_slept;
+          telem.prev_gt911 = brd_power::rtc_state.prev_gt911;
+          telem.boot_count = brd_power::rtc_state.boot_count;
+          telem.job_name = "${name}";
+          telem.since_num = since_num;
+
+          char line[320];
+          brd_power::format_vlogs_message(line, sizeof(line), telem);
+          ESP_LOGI("trace", "%s", line);
+
+          auto post = [](const char *what, const std::string &url, const std::string &body, const char *content_type) {
+            std::vector<http_request::Header> headers;
+            headers.push_back({"Content-Type", content_type});
+
+            auto container = id(http_client).post(url, body, headers);
+            if (container == nullptr) {
+              ESP_LOGW("trace", "%s: request to telemetry host failed", what);
+            } else {
+              ESP_LOGD("trace", "%s: telemetry host returned %d", what, container->status_code);
+              container->end();
+            }
+          };
+
+          if (std::strlen("${vlogs_host}") > 0) {
+            auto json = json::build_json([&](JsonObject root) {
+              root["host"] = "${name}";
+              root["message"] = line;
+            });
+            post("jsonline",
+                 "${vlogs_host}/insert/jsonline?_stream_fields=host&_msg_field=message",
+                 std::string(json.c_str(), json.size()), "application/stream+json");
+          }
+
+          if (std::strlen("${vmetrics_host}") > 0) {
+            char prom[320];
+            brd_power::format_vmetrics_prometheus(prom, sizeof(prom), telem);
+            post("prometheus",
+                 "${vmetrics_host}/api/v1/import/prometheus",
+                 prom, "text/plain");
+          }
+
+          const uint32_t current_batt_mv = brd_power::voltage_to_mv(id(batt_voltage).state);
+          if (current_batt_mv > 0) {
+            brd_power::rtc_state.prev_batt_mv = current_batt_mv;
+          }
+          brd_power::rtc_state.prev_trace_epoch = now_epoch;
+          brd_power::rtc_state.prev_slept = false;
+          brd_power::rtc_state.prev_gt911 = -1;
+          brd_power::rtc_state.update_crc();
+
+  - id: sleep_watchdog
+    mode: single
+    then:
+      - delay: !lambda 'return ${wifi_connect_timeout_sec} * 1000;'
+      - if:
+          condition:
+            and:
+              - lambda: 'return !id(image_download_complete);'
+              - lambda: 'return !id(brd_image_task).is_running() && !brd_power::epd_refresh_active;'
+              - not:
+                  wifi.connected:
+          then:
+            - script.execute: sample_batt
+            - lambda: |-
+                const uint32_t batt_mv = brd_power::voltage_to_mv(id(batt_voltage).state);
+                const bool sof_inc = brd_power::check_usb_sof_incremented();
+                brd_power::rtc_state.staying_awake_usb = brd_power::evaluate_usb_power(
+                    batt_mv, brd_power::rtc_state.prev_batt_mv, false, sof_inc, id(boot_prev_slept));
+                brd_power::rtc_state.update_crc();
+            - if:
+                condition:
+                  lambda: 'return !brd_power::rtc_state.staying_awake_usb;'
+                then:
+                  - logger.log: "WiFi connection timed out. Entering deep sleep."
+                  - script.execute: plan_next_wake
+                  - script.execute: enter_sleep
+                else:
+                  - logger.log: "WiFi connection timed out on USB power. Staying awake."
+
+  - id: enter_sleep
+    then:
+      - if:
+          condition:
+            lambda: 'return brd_power::rtc_state.staying_awake_usb;'
+          then:
+            - logger.log: "USB power is active. Skipping deep sleep."
+            - script.stop: enter_sleep
+
+      - if:
+          condition:
+            lambda: |-
+              return ((id(is_button_wake) || id(is_touch_wake)) &&
+                      millis() < ${min_awake_sec} * 1000);
+          then:
+            - delay: !lambda |-
+                const uint32_t uptime_ms = millis();
+                const uint32_t target_ms = ${min_awake_sec} * 1000;
+                if (uptime_ms < target_ms) {
+                  const uint32_t remaining_ms = target_ms - uptime_ms;
+                  ESP_LOGI("sleep", "Waiting %" PRIu32 " ms to reach minimum awake time", remaining_ms);
+                  return remaining_ms;
+                }
+                return 0;
+
+      - lambda: |-
+          id(awake_duration_sensor).publish_state(millis() / 1000.0f);
+
+      - lambda: |-
+          auto now_time = id(ntp_time).now();
+          if (!now_time.is_valid()) {
+            now_time = id(rtc_time).now();
+          }
+          const int64_t now_epoch = now_time.is_valid() ? now_time.timestamp : 0;
+          brd_schedule::EspHomeTzCalendar cal;
+          brd_schedule::ScheduleConfig cfg;
+          cfg.wake_hour = ${wake_at_hr};
+          cfg.wake_minute = ${wake_at_min};
+          cfg.sleep_hour = ${sleep_at_hr};
+          cfg.sleep_minute = ${sleep_at_min};
+          cfg.fallback_sleep_sec = ${short_sleep_time} * 60;
+
+          brd_schedule::SchedulePlan current_plan;
+          current_plan.mode = id(next_wake_is_overnight) ? "alarm" : "timer";
+          current_plan.target_epoch = id(next_wake_epoch);
+          current_plan.arm_alarm = id(next_wake_alarm);
+          current_plan.sleep_seconds = id(sleep_seconds);
+          current_plan.clock_valid = (id(next_wake_epoch) != 0 && now_epoch > 0);
+
+          const auto final_plan = brd_schedule::revalidate_before_sleep(cal, now_epoch, current_plan, cfg);
+
+          brd_rtc::EspHomeI2cAdapter i2c_bus(id(lilygo_t5_47_plus_i2c));
+          brd_rtc::WakeSettings ws;
+          ws.use_alarm = final_plan.arm_alarm;
+          ws.target_utc_hour = final_plan.target_utc_hour;
+          ws.target_utc_minute = final_plan.target_utc_minute;
+          ws.sleep_seconds = final_plan.sleep_seconds;
+
+          const bool rtc_arm_ok = brd_rtc::arm_wake(i2c_bus, ${rtc_i2c_addr}, ws);
+          if (!rtc_arm_ok) {
+            ESP_LOGW("sleep", "Hardware RTC arming failed. Using internal timer wakeup.");
+            esp_sleep_enable_timer_wakeup(static_cast<uint64_t>(final_plan.sleep_seconds) * 1000000ULL);
+          }
+
+          id(touch).stop_poller();
+          const int gt = brd_power::sleep_gt911_and_hold_int_low(i2c_bus, brd_power::rtc_state.prev_gt911);
+          brd_power::rtc_state.prev_gt911 = gt;
+          brd_power::rtc_state.prev_slept = true;
+          brd_power::rtc_state.update_crc();
+
+          brd_power::prepare_esp32s3_deep_sleep_peripherals();
+          brd_power::arm_deep_sleep_latch();
+
+      - deep_sleep.enter:
+          id: deep_sleep_1
+
+display:
+  - platform: lilygo_t5_47_plus
+    id: t5_display
+    update_interval: never
+    rotation: 270°
+    auto_clear_enabled: false
+
+touchscreen:
+  - platform: lilygo_t5_47_plus
+    id: touch
+    display: t5_display
+    i2c_id: lilygo_t5_47_plus_i2c
+    update_interval: 100ms
+    transform:
+      swap_xy: true
+      mirror_y: true
+    on_touch:
+      - lambda: |-
+          (void) touches;
+          if (!brd_power::is_valid_touch_point(
+                  touch.x, touch.y, id(t5_display).get_width(), id(t5_display).get_height())) {
+            ESP_LOGW("touch", "Ignoring out-of-bounds touch point (%d, %d)", touch.x, touch.y);
+            return;
+          }
+          id(wake_touch_x) = touch.x;
+          id(wake_touch_y) = touch.y;
+          id(wake_touch_x_sensor).publish_state(touch.x);
+          id(wake_touch_y_sensor).publish_state(touch.y);
+          ESP_LOGI("touch", "Recorded touch point (%d, %d)", touch.x, touch.y);
+    on_release:
+      - logger.log: "Touch contact ended."
