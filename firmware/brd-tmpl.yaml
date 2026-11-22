@@ -7,6 +7,7 @@ defaults:
   wake_at_hr: 7
   wake_at_min: 0
   min_awake_sec: 30
+  usb_refresh_interval_min: 5
   periodic_refresh_after_sec: 300
   wifi_connect_timeout_sec: 90
   rtc_i2c_addr: 0x51
@@ -69,7 +70,9 @@ esphome:
             // Clear status flags on hardware RTC and disable clock output.
             brd_rtc::EspHomeI2cAdapter i2c_bus(id(lilygo_t5_47_plus_i2c));
             brd_rtc::RtcStatus rtc_status;
-            brd_rtc::read_and_clear_status_and_disable_clkout(i2c_bus, ${rtc_i2c_addr}, rtc_status);
+            if (!brd_rtc::read_and_clear_status_and_disable_clkout(i2c_bus, ${rtc_i2c_addr}, rtc_status)) {
+              ESP_LOGW("rtc", "Failed to read or clear hardware RTC status.");
+            }
             id(rtc_time).read_time();
 
             const char *classified_reason = brd_power::classify_wake_reason(
@@ -77,15 +80,10 @@ esphome:
             id(wake_reason).publish_state(classified_reason);
 
             id(is_button_wake) = (id(boot_wakeup_cause) == 3 && (id(boot_ext1_mask) & (1ULL << 21)));
-            id(is_touch_wake) = (id(boot_wakeup_cause) == 3 &&
-                                 ((id(boot_ext1_mask) & (1ULL << 10)) || (id(boot_ext1_mask) & (1ULL << 47))));
             id(is_rtc_wake) = (strcmp(classified_reason, "Ext_RTC") == 0 ||
                                strcmp(classified_reason, "Int_RTC") == 0);
-
-            if (!id(is_touch_wake)) {
-              id(wake_touch_x) = -1;
-              id(wake_touch_y) = -1;
-            }
+            id(wake_touch_x) = -1;
+            id(wake_touch_y) = -1;
 
             brd_power::rtc_state.staying_awake_usb = brd_power::check_usb_sof_incremented();
             brd_power::rtc_state.update_crc();
@@ -132,9 +130,6 @@ globals:
   - id: is_button_wake
     type: bool
     initial_value: 'false'
-  - id: is_touch_wake
-    type: bool
-    initial_value: 'false'
   - id: is_rtc_wake
     type: bool
     initial_value: 'false'
@@ -173,8 +168,8 @@ wifi:
         auto rtc_now = id(rtc_time).now();
         const uint32_t current_epoch = rtc_now.is_valid() ? rtc_now.timestamp : 0;
         const bool expired = (brd_power::rtc_state.last_rtc_sync_epoch == 0) ||
-                             (current_epoch > brd_power::rtc_state.last_rtc_sync_epoch &&
-                              (current_epoch - brd_power::rtc_state.last_rtc_sync_epoch) >= 21600);
+                             (current_epoch < brd_power::rtc_state.last_rtc_sync_epoch) ||
+                             ((current_epoch - brd_power::rtc_state.last_rtc_sync_epoch) >= 21600);
         if (!rtc_now.is_valid() || expired) {
           ESP_LOGI("time", "The firmware requests an SNTP time update.");
           if (esp_sntp_enabled()) {
@@ -300,13 +295,16 @@ time:
                 clk.hour = tm_buf.tm_hour;
                 clk.minute = tm_buf.tm_min;
                 clk.second = tm_buf.tm_sec;
-                brd_rtc::write_utc_clock_only(i2c_bus, ${rtc_i2c_addr}, clk);
-                brd_power::rtc_state.last_rtc_sync_epoch = ntp_now.timestamp;
-                brd_power::rtc_state.update_crc();
-                if (!id(rtc_time).now().is_valid()) {
-                  id(rtc_time).read_time();
+                if (brd_rtc::write_utc_clock_only(i2c_bus, ${rtc_i2c_addr}, clk)) {
+                  brd_power::rtc_state.last_rtc_sync_epoch = ntp_now.timestamp;
+                  brd_power::rtc_state.update_crc();
+                  if (!id(rtc_time).now().is_valid()) {
+                    id(rtc_time).read_time();
+                  }
+                  ESP_LOGI("time", "The firmware saved network time to the hardware RTC.");
+                } else {
+                  ESP_LOGW("time", "Failed to save network time to the hardware RTC.");
                 }
-                ESP_LOGI("time", "The firmware saved network time to the hardware RTC.");
               }
             }
 
@@ -339,18 +337,24 @@ interval:
             - if:
                 condition:
                   and:
-                    - lambda: 'return id(image_download_complete);'
                     - lambda: 'return !brd_power::rtc_state.staying_awake_usb;'
+                    - or:
+                        - lambda: 'return id(image_download_complete);'
+                        - lambda: 'return !id(sleep_watchdog).is_running();'
                 then:
+                  - wait_until:
+                      condition:
+                        lambda: 'return !id(brd_image_task).is_running() && !brd_power::epd_refresh_active;'
+                      timeout: 30s
                   - script.execute: plan_next_wake
                   - script.execute: enter_sleep
 
-  - interval: 5min
+  - interval: ${usb_refresh_interval_min}min
     then:
       - if:
           condition:
             and:
-              - lambda: 'return millis() >= ${periodic_refresh_after_sec} * 1000;'
+              - lambda: 'return millis() >= ${periodic_refresh_after_sec} * 1000UL;'
               - wifi.connected:
               - lambda: 'return brd_power::rtc_state.staying_awake_usb;'
           then:
@@ -674,8 +678,8 @@ script:
       - if:
           condition:
             lambda: |-
-              return ((id(is_button_wake) || id(is_touch_wake)) &&
-                      millis() < ${min_awake_sec} * 1000);
+              return (id(is_button_wake) &&
+                      millis() < ${min_awake_sec} * 1000UL);
           then:
             - delay: !lambda |-
                 const uint32_t uptime_ms = millis();
