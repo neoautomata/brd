@@ -142,6 +142,15 @@ globals:
   - id: sleep_seconds
     type: uint32_t
     initial_value: '0'
+  - id: ntp_sync_requested
+    type: bool
+    initial_value: 'false'
+  - id: ntp_synced_this_run
+    type: bool
+    initial_value: 'false'
+  - id: rtc_saved_this_run
+    type: bool
+    initial_value: 'false'
 
 wifi:
   fast_connect: true
@@ -162,30 +171,39 @@ wifi:
         if (brd_power::rtc_state.staying_awake_usb) {
           ESP_LOGI("power", "USB power is active. Keeping device awake.");
         }
-    - component.update: rtc_time
     - lambda: |-
         // Sync network time when the hardware RTC clock is invalid or stale.
+        if (!id(ntp_synced_this_run) && !id(rtc_time).now().is_valid()) {
+          id(rtc_time).read_time();
+        }
         auto rtc_now = id(rtc_time).now();
-        const uint32_t current_epoch = rtc_now.is_valid() ? rtc_now.timestamp : 0;
-        const bool expired = (brd_power::rtc_state.last_rtc_sync_epoch == 0) ||
-                             (current_epoch < brd_power::rtc_state.last_rtc_sync_epoch) ||
-                             ((current_epoch - brd_power::rtc_state.last_rtc_sync_epoch) >= 21600);
-        if (!rtc_now.is_valid() || expired) {
+        const uint32_t current_epoch = rtc_now.is_valid() ? static_cast<uint32_t>(rtc_now.timestamp) : 0U;
+        if (id(ntp_synced_this_run)) {
+          ESP_LOGI("time", "SNTP already synchronized during this wake.");
+        } else if (brd_power::is_rtc_sync_due(rtc_now.is_valid(), current_epoch,
+                                              brd_power::rtc_state.last_rtc_sync_epoch)) {
+          id(ntp_sync_requested) = true;
           ESP_LOGI("time", "The firmware requests an SNTP time update.");
           if (esp_sntp_enabled()) {
             esp_sntp_restart();
+          } else {
+            esp_sntp_init();
           }
         } else {
           ESP_LOGI("time", "The hardware RTC is current. Skipping SNTP update.");
         }
     - if:
         condition:
-          lambda: 'return !id(rtc_time).now().is_valid();'
+          lambda: 'return id(ntp_sync_requested) && !id(ntp_synced_this_run);'
         then:
           - wait_until:
               condition:
-                lambda: 'return id(ntp_time).now().is_valid();'
+                lambda: 'return id(ntp_synced_this_run);'
               timeout: 5s
+          - lambda: |-
+              if (!id(ntp_synced_this_run)) {
+                ESP_LOGW("time", "SNTP time update timed out.");
+              }
     - script.execute: plan_next_wake
     - script.execute: brd_image_task
     - wait_until:
@@ -269,6 +287,7 @@ time:
     timezone: ${local_timezone}
     i2c_id: lilygo_t5_47_plus_i2c
     address: ${rtc_i2c_addr}
+    update_interval: never
 
   - platform: sntp
     id: ntp_time
@@ -280,9 +299,16 @@ time:
     on_time_sync:
       then:
         - lambda: |-
+            // Ignore the initial boot callback triggered from the hardware RTC clock.
+            if (sntp_get_sync_status() != SNTP_SYNC_STATUS_COMPLETED) {
+              ESP_LOGD("time", "Ignoring non-SNTP time_sync callback.");
+              return;
+            }
             // Write network time to the hardware RTC.
             auto ntp_now = id(ntp_time).now();
             if (ntp_now.is_valid()) {
+              id(ntp_synced_this_run) = true;
+              id(rtc_saved_this_run) = false;
               brd_rtc::EspHomeI2cAdapter i2c_bus(id(lilygo_t5_47_plus_i2c));
               brd_rtc::UtcClock clk;
               time_t ts = ntp_now.timestamp;
@@ -296,11 +322,9 @@ time:
                 clk.minute = tm_buf.tm_min;
                 clk.second = tm_buf.tm_sec;
                 if (brd_rtc::write_utc_clock_only(i2c_bus, ${rtc_i2c_addr}, clk)) {
-                  brd_power::rtc_state.last_rtc_sync_epoch = ntp_now.timestamp;
+                  brd_power::rtc_state.last_rtc_sync_epoch = static_cast<uint32_t>(ntp_now.timestamp);
                   brd_power::rtc_state.update_crc();
-                  if (!id(rtc_time).now().is_valid()) {
-                    id(rtc_time).read_time();
-                  }
+                  id(rtc_saved_this_run) = true;
                   ESP_LOGI("time", "The firmware saved network time to the hardware RTC.");
                 } else {
                   ESP_LOGW("time", "Failed to save network time to the hardware RTC.");
@@ -592,8 +616,14 @@ script:
           telem.boot_count = brd_power::rtc_state.boot_count;
           telem.job_name = "${name}";
           telem.since_num = since_num;
+          telem.rtc_sync = brd_power::classify_rtc_sync_status(
+              id(ntp_sync_requested), id(ntp_synced_this_run), id(rtc_saved_this_run));
+          telem.rtc_sync_code = brd_power::classify_rtc_sync_metric(
+              id(ntp_sync_requested), id(ntp_synced_this_run), id(rtc_saved_this_run));
+          telem.rtc_sync_age_sec = brd_power::compute_rtc_sync_age(
+              now_epoch, brd_power::rtc_state.last_rtc_sync_epoch);
 
-          char line[320];
+          char line[384];
           brd_power::format_vlogs_message(line, sizeof(line), telem);
           ESP_LOGI("trace", "%s", line);
 
@@ -621,7 +651,7 @@ script:
           }
 
           if (std::strlen("${vmetrics_host}") > 0) {
-            char prom[320];
+            char prom[448];
             brd_power::format_vmetrics_prometheus(prom, sizeof(prom), telem);
             post("prometheus",
                  "${vmetrics_host}/api/v1/import/prometheus",
@@ -636,6 +666,9 @@ script:
           brd_power::rtc_state.prev_slept = false;
           brd_power::rtc_state.prev_gt911 = -1;
           brd_power::rtc_state.update_crc();
+          id(ntp_sync_requested) = false;
+          id(ntp_synced_this_run) = false;
+          id(rtc_saved_this_run) = false;
 
   - id: sleep_watchdog
     mode: single

@@ -489,14 +489,30 @@ static void test_rtc_bcd_and_retries() {
   assert(mock.registers[0x08] == brd_rtc::dec_to_bcd(26));
   assert(mock.registers[0x0D] == 0x00);
 
-  // Test write_utc_clock_only writes 1 for Sunday and clears VL bit.
+  // Test write_utc_clock_only writes 1 for Sunday, clears VL bit, and clears STOP bit.
+  mock.registers[0x00] = 0x20;  // STOP=1
   clk.year = 2026;
   clk.month = 11;
   clk.day = 15;
   clk.weekday = 0;
   assert(brd_rtc::write_utc_clock_only(mock, 0x51, clk));
+  assert(mock.registers[0x00] == 0x00);
   assert(mock.registers[0x06] == 1);
   assert((mock.registers[0x02] & 0x80) == 0);
+
+  // Test write_utc_clock_only rejects out-of-range fields.
+  brd_rtc::UtcClock bad_clk = clk;
+  bad_clk.year = 1999;
+  assert(!brd_rtc::write_utc_clock_only(mock, 0x51, bad_clk));
+  bad_clk = clk;
+  bad_clk.hour = 24;
+  assert(!brd_rtc::write_utc_clock_only(mock, 0x51, bad_clk));
+  bad_clk = clk;
+  bad_clk.minute = 60;
+  assert(!brd_rtc::write_utc_clock_only(mock, 0x51, bad_clk));
+  bad_clk = clk;
+  bad_clk.second = 60;
+  assert(!brd_rtc::write_utc_clock_only(mock, 0x51, bad_clk));
 
   // Test repair_sunday_weekday_if_valid repairs 0 -> 1 when VL == 0 on Sunday 2026-11-15.
   mock.registers[0x02] = brd_rtc::dec_to_bcd(10);  // VL == 0
@@ -694,6 +710,57 @@ static void test_power_state_and_telemetry() {
   // 5. None of the above returns false.
   assert(!brd_power::evaluate_usb_power(4100, 4100, false, false, false));
 
+  // Table-driven tests for RTC/NTP sync helpers.
+  struct SyncDueCase {
+    bool rtc_valid;
+    uint32_t current_epoch;
+    uint32_t last_sync_epoch;
+    bool expected_due;
+  };
+  constexpr SyncDueCase SYNC_DUE_CASES[] = {
+      {false, 1795500000U, 1795499900U, true},   // Invalid RTC clock
+      {true, 1795500000U, 0U, true},             // Never synced
+      {true, 1795499999U, 1795500000U, true},    // Clock rolled back
+      {true, 1795500000U, 1795500000U, false},   // Just synced
+      {true, 1795521599U, 1795500000U, false},   // 1 second before 6h interval
+      {true, 1795521600U, 1795500000U, true},    // Exact 6h boundary
+      {true, 1795530000U, 1795500000U, true},    // Past 6h interval
+  };
+  for (const auto &tc : SYNC_DUE_CASES) {
+    assert(brd_power::is_rtc_sync_due(tc.rtc_valid, tc.current_epoch, tc.last_sync_epoch) ==
+           tc.expected_due);
+  }
+
+  struct SyncStatusCase {
+    bool requested;
+    bool ntp_synced;
+    bool rtc_saved;
+    const char *expected_status;
+    int expected_metric;
+  };
+  constexpr SyncStatusCase SYNC_STATUS_CASES[] = {
+      {false, false, false, "skipped", 0},
+      {false, false, true, "skipped", 0},
+      {true, false, false, "timeout", -1},
+      {true, false, true, "timeout", -1},
+      {false, true, false, "save_err", -1},
+      {true, true, false, "save_err", -1},
+      {false, true, true, "synced", 1},
+      {true, true, true, "synced", 1},
+  };
+  for (const auto &tc : SYNC_STATUS_CASES) {
+    assert(std::strcmp(brd_power::classify_rtc_sync_status(tc.requested, tc.ntp_synced, tc.rtc_saved),
+                       tc.expected_status) == 0);
+    assert(brd_power::classify_rtc_sync_metric(tc.requested, tc.ntp_synced, tc.rtc_saved) ==
+           tc.expected_metric);
+  }
+
+  assert(brd_power::compute_rtc_sync_age(0U, 1795500000U) == -1);
+  assert(brd_power::compute_rtc_sync_age(1795500000U, 0U) == -1);
+  assert(brd_power::compute_rtc_sync_age(1795499999U, 1795500000U) == -1);
+  assert(brd_power::compute_rtc_sync_age(1795500000U, 1795500000U) == 0);
+  assert(brd_power::compute_rtc_sync_age(1795500900U, 1795500000U) == 900);
+
   // Telemetry formatters.
   brd_power::TraceTelemetry telem;
   telem.wake_reason = "Ext_RTC";
@@ -713,20 +780,37 @@ static void test_power_state_and_telemetry() {
   telem.boot_count = 15;
   telem.job_name = "brd";
   telem.since_num = 900;
+  telem.rtc_sync = "synced";
+  telem.rtc_sync_code = 1;
+  telem.rtc_sync_age_sec = 0;
 
-  char vlogs_msg[320];
+  char vlogs_msg[384];
   int vlen = brd_power::format_vlogs_message(vlogs_msg, sizeof(vlogs_msg), telem);
   assert(vlen > 0 && static_cast<size_t>(vlen) < sizeof(vlogs_msg));
   assert(std::strstr(vlogs_msg, "wake=Ext_RTC mode=timer batt=4.12V batt_pct=92% awake=2.4s image=new touch=none") != nullptr);
-  assert(std::strstr(vlogs_msg, "prev_gt911=0x5D boots=15") != nullptr);
+  assert(std::strstr(vlogs_msg, "prev_gt911=0x5D boots=15 rtc_sync=synced rtc_sync_age=0s") != nullptr);
 
-  char vmetrics_prom[320];
+  char vmetrics_prom[448];
   int plen = brd_power::format_vmetrics_prometheus(vmetrics_prom, sizeof(vmetrics_prom), telem);
   assert(plen > 0 && static_cast<size_t>(plen) < sizeof(vmetrics_prom));
   assert(std::strstr(vmetrics_prom, "battery_voltage{job=\"brd\"} 4.12") != nullptr);
   assert(std::strstr(vmetrics_prom, "battery_percent{job=\"brd\"} 92") != nullptr);
   assert(std::strstr(vmetrics_prom, "gt911_slept{job=\"brd\"} 1") != nullptr);
   assert(std::strstr(vmetrics_prom, "boot_count{job=\"brd\"} 15") != nullptr);
+  assert(std::strstr(vmetrics_prom, "rtc_synced{job=\"brd\"} 1") != nullptr);
+  assert(std::strstr(vmetrics_prom, "rtc_sync_age_secs{job=\"brd\"} 0") != nullptr);
+
+  // Telemetry formatting when RTC sync timed out and age is unknown.
+  telem.rtc_sync = "timeout";
+  telem.rtc_sync_code = -1;
+  telem.rtc_sync_age_sec = -1;
+  vlen = brd_power::format_vlogs_message(vlogs_msg, sizeof(vlogs_msg), telem);
+  assert(vlen > 0 && static_cast<size_t>(vlen) < sizeof(vlogs_msg));
+  assert(std::strstr(vlogs_msg, "rtc_sync=timeout rtc_sync_age=unknown") != nullptr);
+  plen = brd_power::format_vmetrics_prometheus(vmetrics_prom, sizeof(vmetrics_prom), telem);
+  assert(plen > 0 && static_cast<size_t>(plen) < sizeof(vmetrics_prom));
+  assert(std::strstr(vmetrics_prom, "rtc_synced{job=\"brd\"} -1") != nullptr);
+  assert(std::strstr(vmetrics_prom, "rtc_sync_age_secs{job=\"brd\"} -1") != nullptr);
 
   printf("  -> Passed power state and telemetry checks.\n");
 }

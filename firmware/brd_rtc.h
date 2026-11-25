@@ -148,8 +148,11 @@ inline bool read_and_clear_status_and_disable_clkout(I2cPort &i2c, uint8_t rtc_a
   return repair_sunday_weekday_if_valid(i2c, rtc_addr);
 }
 
-// Write UTC clock values to registers 0x02 through 0x08 and disable clock output.
+// Write UTC clock values to registers 0x02 through 0x08, ensure the oscillator runs, and disable clock output.
 inline bool write_utc_clock_only(I2cPort &i2c, uint8_t rtc_addr, const UtcClock &clk) {
+  if (clk.year < 2000 || clk.year > 2099 || clk.hour > 23 || clk.minute > 59 || clk.second > 59) {
+    return false;
+  }
   const uint8_t esphome_wday = compute_esphome_weekday(clk.year, clk.month, clk.day);
   if (esphome_wday < 1 || esphome_wday > 7) {
     return false;
@@ -166,6 +169,12 @@ inline bool write_utc_clock_only(I2cPort &i2c, uint8_t rtc_addr, const UtcClock 
   buf[7] = dec_to_bcd(static_cast<uint8_t>(clk.year % 100));
 
   if (!retry_write(i2c, rtc_addr, buf, 8)) {
+    return false;
+  }
+
+  // Clear Control_status_1 (STOP bit) so the hardware oscillator runs.
+  const uint8_t run_osc_buf[2] = {0x00, 0x00};
+  if (!retry_write(i2c, rtc_addr, run_osc_buf, 2)) {
     return false;
   }
 

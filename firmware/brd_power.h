@@ -17,6 +17,7 @@
 namespace brd_power {
 
 constexpr uint32_t RTC_STATE_MAGIC = 0x42524450;
+constexpr uint32_t RTC_SYNC_INTERVAL_SEC = 21600U;
 
 // Bit constants for the 74HCT4094D shift register.
 // CFG_RAILS_ONLY_ON sets ep_scan_direction=1 and power_disable=1.
@@ -190,6 +191,41 @@ inline bool evaluate_usb_power(uint32_t current_mv, uint32_t prev_mv, bool curre
   return false;
 }
 
+inline bool is_rtc_sync_due(bool rtc_valid, uint32_t current_epoch, uint32_t last_sync_epoch,
+                            uint32_t interval_sec = RTC_SYNC_INTERVAL_SEC) {
+  if (!rtc_valid || last_sync_epoch == 0U || current_epoch < last_sync_epoch) {
+    return true;
+  }
+  return (current_epoch - last_sync_epoch) >= interval_sec;
+}
+
+inline const char *classify_rtc_sync_status(bool sync_requested, bool ntp_synced, bool rtc_saved) {
+  if (ntp_synced) {
+    return rtc_saved ? "synced" : "save_err";
+  }
+  if (sync_requested) {
+    return "timeout";
+  }
+  return "skipped";
+}
+
+inline int classify_rtc_sync_metric(bool sync_requested, bool ntp_synced, bool rtc_saved) {
+  if (ntp_synced) {
+    return rtc_saved ? 1 : -1;
+  }
+  if (sync_requested) {
+    return -1;
+  }
+  return 0;
+}
+
+inline long compute_rtc_sync_age(uint32_t now_epoch, uint32_t last_sync_epoch) {
+  if (now_epoch == 0U || last_sync_epoch == 0U || now_epoch < last_sync_epoch) {
+    return -1;
+  }
+  return static_cast<long>(now_epoch - last_sync_epoch);
+}
+
 struct TraceTelemetry {
   const char *wake_reason{"unknown"};
   const char *mode{"none"};
@@ -208,6 +244,9 @@ struct TraceTelemetry {
   uint32_t boot_count{0};
   const char *job_name{"brd"};
   long since_num{-1};
+  const char *rtc_sync{"skipped"};
+  int rtc_sync_code{0};
+  long rtc_sync_age_sec{-1};
 };
 
 inline int format_vlogs_message(char *buf, size_t len, const TraceTelemetry &t) {
@@ -223,9 +262,17 @@ inline int format_vlogs_message(char *buf, size_t len, const TraceTelemetry &t) 
                        : (t.prev_gt911 == 0) ? "nack"
                                              : "none";
 
+  char sync_age_buf[24];
+  if (t.rtc_sync_age_sec >= 0) {
+    snprintf(sync_age_buf, sizeof(sync_age_buf), "%lds", t.rtc_sync_age_sec);
+  } else {
+    snprintf(sync_age_buf, sizeof(sync_age_buf), "unknown");
+  }
+
   return snprintf(buf, len,
                   "wake=%s mode=%s batt=%.2fV batt_pct=%.0f%% awake=%.1fs image=%s touch=%s "
-                  "now=%s next=%s next_in=%ss since=%ss slept=%s prev_gt911=%s boots=%" PRIu32,
+                  "now=%s next=%s next_in=%ss since=%ss slept=%s prev_gt911=%s boots=%" PRIu32
+                  " rtc_sync=%s rtc_sync_age=%s",
                   t.wake_reason != nullptr ? t.wake_reason : "unknown",
                   t.mode != nullptr ? t.mode : "none",
                   t.batt_v,
@@ -239,7 +286,9 @@ inline int format_vlogs_message(char *buf, size_t len, const TraceTelemetry &t) 
                   t.since_str != nullptr ? t.since_str : "unknown",
                   t.prev_slept ? "yes" : "no",
                   gt_str,
-                  t.boot_count);
+                  t.boot_count,
+                  t.rtc_sync != nullptr ? t.rtc_sync : "skipped",
+                  sync_age_buf);
 }
 
 inline int format_vmetrics_prometheus(char *buf, size_t len, const TraceTelemetry &t) {
@@ -253,14 +302,18 @@ inline int format_vmetrics_prometheus(char *buf, size_t len, const TraceTelemetr
                   "run_gap_secs{job=\"%s\"} %ld\n"
                   "prev_slept{job=\"%s\"} %d\n"
                   "gt911_slept{job=\"%s\"} %d\n"
-                  "boot_count{job=\"%s\"} %" PRIu32,
+                  "boot_count{job=\"%s\"} %" PRIu32 "\n"
+                  "rtc_synced{job=\"%s\"} %d\n"
+                  "rtc_sync_age_secs{job=\"%s\"} %ld",
                   job, t.batt_v,
                   job, t.batt_pct,
                   job, t.awake_s,
                   job, t.since_num,
                   job, t.prev_slept ? 1 : 0,
                   job, gt911_slept_val,
-                  job, t.boot_count);
+                  job, t.boot_count,
+                  job, t.rtc_sync_code,
+                  job, t.rtc_sync_age_sec);
 }
 
 }  // namespace brd_power
