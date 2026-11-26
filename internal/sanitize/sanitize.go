@@ -233,9 +233,18 @@ func sanitizeStyle(raw string) string {
 	return strings.Join(kept, "; ")
 }
 
+func hasUnsafeURLChars(s string) bool {
+	for _, r := range s {
+		if r == '\\' || r < 0x20 || r == 0x7f {
+			return true
+		}
+	}
+	return false
+}
+
 func isSafeHref(raw string) bool {
 	trimmed := strings.TrimSpace(raw)
-	if trimmed == "" {
+	if trimmed == "" || hasUnsafeURLChars(trimmed) {
 		return false
 	}
 	if strings.HasPrefix(trimmed, "#") {
@@ -246,7 +255,7 @@ func isSafeHref(raw string) bool {
 		return false
 	}
 	if u.Scheme == "" {
-		return u.Host == ""
+		return u.Host == "" && !strings.HasPrefix(trimmed, "//")
 	}
 	switch strings.ToLower(u.Scheme) {
 	case "http", "https", "mailto":
@@ -258,7 +267,7 @@ func isSafeHref(raw string) bool {
 
 func isSafeImgSrc(raw string) bool {
 	trimmed := strings.TrimSpace(raw)
-	if trimmed == "" {
+	if trimmed == "" || hasUnsafeURLChars(trimmed) {
 		return false
 	}
 	lower := strings.ToLower(trimmed)
@@ -277,7 +286,7 @@ func isSafeImgSrc(raw string) bool {
 		return false
 	}
 	if u.Scheme == "" {
-		return u.Host == "" && strings.HasPrefix(trimmed, "/")
+		return u.Host == "" && strings.HasPrefix(trimmed, "/") && !strings.HasPrefix(trimmed, "//")
 	}
 	switch strings.ToLower(u.Scheme) {
 	case "http", "https":

@@ -26,10 +26,18 @@ import (
 )
 
 const (
-	oauthStateBytes = 32
-	oauthStateTTL   = 10 * time.Minute
-	fetchTimeout    = 15 * time.Second
+	oauthStateBytes      = 32
+	oauthStateTTL        = 10 * time.Minute
+	maxPendingStates     = 256
+	oauthStateCookieName = "brd_oauth_state"
+	fetchTimeout         = 15 * time.Second
+	maxEventPages        = 20
 )
+
+type pendingOAuthState struct {
+	verifier string
+	expires  time.Time
+}
 
 // EventFetcher lists calendar events for one calendar ID in a time range.
 type EventFetcher interface {
@@ -41,18 +49,30 @@ type googleEventFetcher struct {
 }
 
 func (g *googleEventFetcher) ListEvents(ctx context.Context, calID, timeMin, timeMax string) ([]*gcal.Event, error) {
-	resp, err := g.srv.Events.List(calID).
-		Context(ctx).
-		ShowDeleted(false).
-		SingleEvents(true).
-		TimeMin(timeMin).
-		TimeMax(timeMax).
-		OrderBy("startTime").
-		Do()
-	if err != nil {
-		return nil, err
+	var items []*gcal.Event
+	pageToken := ""
+	for page := 0; page < maxEventPages; page++ {
+		call := g.srv.Events.List(calID).
+			Context(ctx).
+			ShowDeleted(false).
+			SingleEvents(true).
+			TimeMin(timeMin).
+			TimeMax(timeMax).
+			OrderBy("startTime")
+		if pageToken != "" {
+			call = call.PageToken(pageToken)
+		}
+		resp, err := call.Do()
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, resp.Items...)
+		if resp.NextPageToken == "" {
+			break
+		}
+		pageToken = resp.NextPageToken
 	}
-	return resp.Items, nil
+	return items, nil
 }
 
 // Options configures a calendar Service.
@@ -89,7 +109,7 @@ type Service struct {
 	tokenFileMu sync.Mutex
 
 	stateMu       sync.Mutex
-	pendingStates map[string]time.Time
+	pendingStates map[string]pendingOAuthState
 }
 
 // NewService creates a calendar Service and attempts initial OAuth setup when no custom Fetcher is provided.
@@ -113,7 +133,7 @@ func NewService(ctx context.Context, opts Options) (*Service, error) {
 		clientSecretFile: opts.ClientSecretFile,
 		nowFn:            nowFn,
 		fetcher:          opts.Fetcher,
-		pendingStates:    make(map[string]time.Time),
+		pendingStates:    make(map[string]pendingOAuthState),
 	}
 
 	if s.fetcher != nil {
@@ -165,16 +185,22 @@ func oauthHTTPContext(parent context.Context) context.Context {
 
 func (s *Service) init(ctx context.Context) error {
 	if s.clientSecretFile == "" {
-		return errors.New("client secret path is empty")
+		err := errors.New("client secret path is empty")
+		s.recordSetupError(err)
+		return err
 	}
 	b, err := os.ReadFile(s.clientSecretFile)
 	if err != nil {
-		return fmt.Errorf("read client secret file: %w", err)
+		wrapErr := fmt.Errorf("read client secret file: %w", err)
+		s.recordSetupError(wrapErr)
+		return wrapErr
 	}
 
 	cfg, err := google.ConfigFromJSON(b, gcal.CalendarReadonlyScope)
 	if err != nil {
-		return fmt.Errorf("parse client secret JSON: %w", err)
+		wrapErr := fmt.Errorf("parse client secret JSON: %w", err)
+		s.recordSetupError(wrapErr)
+		return wrapErr
 	}
 
 	s.mu.Lock()
@@ -370,25 +396,27 @@ func (s *Service) Events(ctx context.Context, t time.Time) ([]*gcal.Event, error
 	fetchCtx, cancel := context.WithTimeout(ctx, fetchTimeout)
 	defer cancel()
 
-	resChan := make(chan calResult, len(s.calendars))
+	// Collect per-calendar responses in deterministic config order.
+	results := make([]calResult, len(s.calendars))
 	var wg sync.WaitGroup
-	for _, calID := range s.calendars {
+	for i, calID := range s.calendars {
 		wg.Add(1)
-		go func(id string) {
+		go func(idx int, id string) {
 			defer wg.Done()
 			items, err := fetcher.ListEvents(fetchCtx, id, timeMin, timeMax)
-			resChan <- calResult{cal: id, items: items, err: err}
-		}(calID)
+			results[idx] = calResult{cal: id, items: items, err: err}
+		}(i, calID)
 	}
 	wg.Wait()
-	close(resChan)
 
 	var events []*gcal.Event
 	var firstErr error
 	successCount := 0
-	for res := range resChan {
+	failCount := 0
+	for _, res := range results {
 		if res.err != nil {
 			log.Printf("Calendar fetch failed for %s: %v", res.cal, res.err)
+			failCount++
 			if firstErr == nil {
 				firstErr = res.err
 			}
@@ -400,6 +428,9 @@ func (s *Service) Events(ctx context.Context, t time.Time) ([]*gcal.Event, error
 
 	if successCount == 0 && firstErr != nil {
 		return nil, fmt.Errorf("all calendar requests failed: %w", firstErr)
+	}
+	if failCount > 0 {
+		log.Printf("Calendar partial failure: %d of %d calendars failed", failCount, len(s.calendars))
 	}
 
 	// Deduplicate by event ID, drop nil entries, and exclude out-of-range all-day events.
@@ -495,14 +526,30 @@ func (s *Service) RedirectForToken(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	state, err := s.issueState()
+	state, verifier, err := s.issueStateWithVerifier()
 	if err != nil {
 		log.Printf("Generate OAuth state failed: %v", err)
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
 
-	authURL := cfg.AuthCodeURL(state, oauth2.AccessTypeOffline, oauth2.ApprovalForce)
+	isHTTPS := r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
+	http.SetCookie(w, &http.Cookie{
+		Name:     oauthStateCookieName,
+		Value:    state,
+		Path:     "/savetoken",
+		MaxAge:   int(oauthStateTTL.Seconds()),
+		HttpOnly: true,
+		Secure:   isHTTPS,
+		SameSite: http.SameSiteLaxMode,
+	})
+
+	authURL := cfg.AuthCodeURL(
+		state,
+		oauth2.AccessTypeOffline,
+		oauth2.ApprovalForce,
+		oauth2.S256ChallengeOption(verifier),
+	)
 	http.Redirect(w, r, authURL, http.StatusSeeOther)
 }
 
@@ -527,7 +574,22 @@ func (s *Service) ProcessAuthCode(w http.ResponseWriter, r *http.Request) {
 	}
 
 	state := r.FormValue("state")
-	if !s.consumeState(state) {
+	cookie, err := r.Cookie(oauthStateCookieName)
+	if err != nil || subtle.ConstantTimeCompare([]byte(cookie.Value), []byte(state)) != 1 {
+		http.Error(w, "Invalid or expired OAuth state", http.StatusBadRequest)
+		return
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     oauthStateCookieName,
+		Value:    "",
+		Path:     "/savetoken",
+		MaxAge:   -1,
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+	})
+
+	verifier, ok := s.consumeStateWithVerifier(state)
+	if !ok {
 		http.Error(w, "Invalid or expired OAuth state", http.StatusBadRequest)
 		return
 	}
@@ -540,7 +602,7 @@ func (s *Service) ProcessAuthCode(w http.ResponseWriter, r *http.Request) {
 
 	exchCtx, cancel := context.WithTimeout(r.Context(), fetchTimeout)
 	defer cancel()
-	tok, err := cfg.Exchange(oauthHTTPContext(exchCtx), code)
+	tok, err := cfg.Exchange(oauthHTTPContext(exchCtx), code, oauth2.VerifierOption(verifier))
 	if err != nil {
 		log.Printf("OAuth code exchange failed: %v", err)
 		http.Error(w, "Token exchange failed", http.StatusInternalServerError)
@@ -571,23 +633,50 @@ func (s *Service) ProcessAuthCode(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Service) issueState() (string, error) {
+	state, _, err := s.issueStateWithVerifier()
+	return state, err
+}
+
+func (s *Service) issueStateWithVerifier() (string, string, error) {
 	buf := make([]byte, oauthStateBytes)
 	if _, err := rand.Read(buf); err != nil {
-		return "", err
+		return "", "", err
 	}
 	token := hex.EncodeToString(buf)
+	verifier := oauth2.GenerateVerifier()
 	now := s.nowFn()
 
 	s.stateMu.Lock()
 	defer s.stateMu.Unlock()
 	s.pruneStatesLocked(now)
-	s.pendingStates[token] = now.Add(oauthStateTTL)
-	return token, nil
+	if len(s.pendingStates) >= maxPendingStates {
+		oldestKey := ""
+		var oldestExp time.Time
+		for k, entry := range s.pendingStates {
+			if oldestKey == "" || entry.expires.Before(oldestExp) {
+				oldestKey = k
+				oldestExp = entry.expires
+			}
+		}
+		if oldestKey != "" {
+			delete(s.pendingStates, oldestKey)
+		}
+	}
+	s.pendingStates[token] = pendingOAuthState{
+		verifier: verifier,
+		expires:  now.Add(oauthStateTTL),
+	}
+	return token, verifier, nil
 }
 
 func (s *Service) consumeState(candidate string) bool {
+	_, ok := s.consumeStateWithVerifier(candidate)
+	return ok
+}
+
+func (s *Service) consumeStateWithVerifier(candidate string) (string, bool) {
 	if candidate == "" {
-		return false
+		return "", false
 	}
 	now := s.nowFn()
 
@@ -602,15 +691,16 @@ func (s *Service) consumeState(candidate string) bool {
 		}
 	}
 	if matchedKey == "" {
-		return false
+		return "", false
 	}
+	verifier := s.pendingStates[matchedKey].verifier
 	delete(s.pendingStates, matchedKey)
-	return true
+	return verifier, true
 }
 
 func (s *Service) pruneStatesLocked(now time.Time) {
-	for k, exp := range s.pendingStates {
-		if !exp.After(now) {
+	for k, entry := range s.pendingStates {
+		if !entry.expires.After(now) {
 			delete(s.pendingStates, k)
 		}
 	}

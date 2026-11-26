@@ -90,7 +90,6 @@ func Parse(data []byte, baseDir string) (*Config, error) {
 		RetentionDays:        defaultRetentionDays,
 		Transit: TransitConfig{
 			CacheDurationSeconds: defaultTransitCacheSeconds,
-			Lines:                []string{"9", "14"},
 			MaxDepartures:        defaultTransitMaxDepartures,
 		},
 	}
@@ -108,6 +107,7 @@ func Parse(data []byte, baseDir string) (*Config, error) {
 }
 
 func (c *Config) validateAndNormalize(baseDir string) error {
+	c.DataDir = strings.TrimSpace(c.DataDir)
 	if err := validatePathString("data_dir", c.DataDir); err != nil {
 		return err
 	}
@@ -132,9 +132,11 @@ func (c *Config) validateAndNormalize(baseDir string) error {
 		return fmt.Errorf("invalid tailnet_hostname %q", c.TailnetHostname)
 	}
 
+	c.TailnetAddr = strings.TrimSpace(c.TailnetAddr)
 	if err := validateAddr("tailnet_addr", c.TailnetAddr); err != nil {
 		return err
 	}
+	c.LocalAddr = strings.TrimSpace(c.LocalAddr)
 	if err := validateAddr("local_addr", c.LocalAddr); err != nil {
 		return err
 	}

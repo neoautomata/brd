@@ -46,6 +46,12 @@ func TestHTML(t *testing.T) {
 			wantAbsent:   []string{"evil.example"},
 		},
 		{
+			name:         "blocks backslash and control characters in href and img src",
+			input:        `<a href="/\evil.example/phish">BadLink</a><img src="/\evil.example/a.png"><a href="/ok\n">Ctrl</a>`,
+			wantContains: []string{`<a>BadLink</a>`, `<img>`},
+			wantAbsent:   []string{"evil.example", `/\`},
+		},
+		{
 			name:         "adds rel noopener noreferrer when target is _blank",
 			input:        `<a href="https://example.com" target="_blank">External</a>`,
 			wantContains: []string{`target="_blank"`, `rel="noopener noreferrer"`},

@@ -27,9 +27,15 @@ const (
 	maxUpdateBodyBytes   = 1 << 20 // 1 MiB
 	csrfTokenBytes       = 32
 	csrfTokenTTL         = 2 * time.Hour
+	maxCSRFTokens        = 1024
 	maxUpdateHorizonDays = 365
 	updateRegenTimeout   = 25 * time.Second
 )
+
+type csrfEntry struct {
+	user    string
+	expires time.Time
+}
 
 //go:embed files/ckengine5.css
 var cssData []byte
@@ -83,7 +89,7 @@ type Server struct {
 	nowFn       func() time.Time
 
 	csrfMu     sync.Mutex
-	csrfTokens map[string]time.Time
+	csrfTokens map[string]csrfEntry
 }
 
 // NewServer creates a Server with explicit dependencies.
@@ -99,7 +105,7 @@ func NewServer(deps Dependencies) *Server {
 		transit:     deps.Transit,
 		regenerator: deps.Regenerator,
 		nowFn:       nowFn,
-		csrfTokens:  make(map[string]time.Time),
+		csrfTokens:  make(map[string]csrfEntry),
 	}
 }
 
@@ -233,7 +239,8 @@ func (s *Server) handleEdit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	csrfToken, err := s.issueCSRFToken()
+	user := auth.UserFromContext(r.Context())
+	csrfToken, err := s.issueCSRFTokenForUser(user)
 	if err != nil {
 		log.Printf("Generate CSRF token failed: %v", err)
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
@@ -245,7 +252,7 @@ func (s *Server) handleEdit(w http.ResponseWriter, r *http.Request) {
 		"dateStr":     dateStr,
 		"backURL":     "/?date=" + dateStr,
 		"csrfToken":   csrfToken,
-		"fileContent": string(noteBytes),
+		"fileContent": sanitize.HTML(string(noteBytes)),
 	}
 	renderTemplate(w, editTmpl, data)
 }
@@ -269,7 +276,8 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !s.consumeCSRFToken(r.PostFormValue("csrf_token")) {
+	user := auth.UserFromContext(r.Context())
+	if !s.consumeCSRFTokenForUser(r.PostFormValue("csrf_token"), user) {
 		http.Error(w, "Invalid or expired CSRF token", http.StatusForbidden)
 		return
 	}
@@ -360,6 +368,10 @@ func (s *Server) parseQueryDate(raw string, now time.Time) (time.Time, string, e
 }
 
 func (s *Server) issueCSRFToken() (string, error) {
+	return s.issueCSRFTokenForUser("")
+}
+
+func (s *Server) issueCSRFTokenForUser(user string) (string, error) {
 	buf := make([]byte, csrfTokenBytes)
 	if _, err := rand.Read(buf); err != nil {
 		return "", err
@@ -369,16 +381,33 @@ func (s *Server) issueCSRFToken() (string, error) {
 
 	s.csrfMu.Lock()
 	defer s.csrfMu.Unlock()
-	for k, exp := range s.csrfTokens {
-		if !exp.After(now) {
+	for k, entry := range s.csrfTokens {
+		if !entry.expires.After(now) {
 			delete(s.csrfTokens, k)
 		}
 	}
-	s.csrfTokens[token] = now.Add(csrfTokenTTL)
+	// Evict the soonest-expiring entry when the map reaches its hard cap.
+	if len(s.csrfTokens) >= maxCSRFTokens {
+		oldestKey := ""
+		var oldestExp time.Time
+		for k, entry := range s.csrfTokens {
+			if oldestKey == "" || entry.expires.Before(oldestExp) {
+				oldestKey = k
+				oldestExp = entry.expires
+			}
+		}
+		if oldestKey != "" {
+			delete(s.csrfTokens, oldestKey)
+		}
+	}
+	s.csrfTokens[token] = csrfEntry{
+		user:    user,
+		expires: now.Add(csrfTokenTTL),
+	}
 	return token, nil
 }
 
-func (s *Server) consumeCSRFToken(candidate string) bool {
+func (s *Server) consumeCSRFTokenForUser(candidate, user string) bool {
 	if candidate == "" {
 		return false
 	}
@@ -387,13 +416,15 @@ func (s *Server) consumeCSRFToken(candidate string) bool {
 	s.csrfMu.Lock()
 	defer s.csrfMu.Unlock()
 	matchedKey := ""
-	for k, exp := range s.csrfTokens {
-		if !exp.After(now) {
+	for k, entry := range s.csrfTokens {
+		if !entry.expires.After(now) {
 			delete(s.csrfTokens, k)
 			continue
 		}
 		if subtle.ConstantTimeCompare([]byte(k), []byte(candidate)) == 1 {
-			matchedKey = k
+			if entry.user == "" || entry.user == user {
+				matchedKey = k
+			}
 		}
 	}
 	if matchedKey == "" {

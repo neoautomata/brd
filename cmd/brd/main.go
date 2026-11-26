@@ -96,6 +96,10 @@ func run() error {
 	}
 	defer tsServer.Close()
 
+	if _, err := tsServer.Up(rootCtx); err != nil {
+		return fmt.Errorf("start tailnet server: %w", err)
+	}
+
 	tsListener, err := tsServer.Listen("tcp", cfg.TailnetAddr)
 	if err != nil {
 		return fmt.Errorf("listen on tailnet %s: %w", cfg.TailnetAddr, err)
@@ -271,9 +275,21 @@ func runRegenCycle(ctx context.Context, cfg *config.Config, captureSvc *capture.
 func shutdownServers(servers ...*http.Server) {
 	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
+	var wg sync.WaitGroup
 	for _, srv := range servers {
-		if err := srv.Shutdown(ctx); err != nil {
-			log.Printf("HTTP server shutdown error: %v", err)
+		if srv == nil {
+			continue
 		}
+		wg.Add(1)
+		go func(s *http.Server) {
+			defer wg.Done()
+			if err := s.Shutdown(ctx); err != nil {
+				log.Printf("HTTP server shutdown error: %v", err)
+				if closeErr := s.Close(); closeErr != nil {
+					log.Printf("HTTP server force close error: %v", closeErr)
+				}
+			}
+		}(srv)
 	}
+	wg.Wait()
 }

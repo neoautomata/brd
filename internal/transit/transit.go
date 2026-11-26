@@ -15,6 +15,8 @@ import (
 
 const (
 	defaultCacheDuration = 10 * time.Minute
+	defaultErrorBackoff  = 30 * time.Second
+	defaultMaxStaleAge   = 2 * time.Hour
 	maxResponseBytes     = 2 << 20 // 2 MiB
 	defaultMaxDepartures = 4
 )
@@ -97,14 +99,18 @@ type LineDepartures struct {
 // Service fetches, caches, and formats transit departures.
 type Service struct {
 	mu            sync.RWMutex
+	fetchMu       sync.Mutex
 	apiURL        string
 	cacheDuration time.Duration
+	errorBackoff  time.Duration
+	maxStaleAge   time.Duration
 	httpClient    *http.Client
 	filter        FilterOptions
 	nowFn         func() time.Time
 
 	cachedResponse *StationboardResponse
 	cachedAt       time.Time
+	lastErrAt      time.Time
 }
 
 // NewService constructs a transit Service with explicit dependencies.
@@ -119,9 +125,16 @@ func NewService(apiURL string, cacheDuration time.Duration, client *http.Client,
 	copy(lines, filter.Lines)
 	filter.Lines = lines
 
+	maxStale := defaultMaxStaleAge
+	if sixX := 6 * cacheDuration; sixX > maxStale {
+		maxStale = sixX
+	}
+
 	return &Service{
 		apiURL:        strings.TrimSpace(apiURL),
 		cacheDuration: cacheDuration,
+		errorBackoff:  defaultErrorBackoff,
+		maxStaleAge:   maxStale,
 		httpClient:    client,
 		filter:        filter,
 		nowFn:         time.Now,
@@ -129,28 +142,44 @@ func NewService(apiURL string, cacheDuration time.Duration, client *http.Client,
 }
 
 // Fetch returns cached departures when fresh or queries the remote API.
-// It releases the mutex before executing network I/O and falls back to stale cache on errors.
+// Concurrent misses serialize via fetchMu to avoid upstream stampedes, and transient errors
+// back off briefly while falling back to bounded stale cache.
 func (s *Service) Fetch(ctx context.Context) (*StationboardResponse, error) {
 	now := s.nowFn()
 
 	s.mu.RLock()
-	if s.cachedResponse != nil && now.Sub(s.cachedAt) < s.cacheDuration {
-		resp := s.cachedResponse
+	if resp, ok := s.usableCacheLocked(now); ok {
 		s.mu.RUnlock()
 		return resp, nil
 	}
 	targetURL := s.apiURL
 	client := s.httpClient
-	stale := s.cachedResponse
 	s.mu.RUnlock()
 
 	if targetURL == "" {
 		return &StationboardResponse{}, nil
 	}
 
+	s.fetchMu.Lock()
+	defer s.fetchMu.Unlock()
+
+	now = s.nowFn()
+	s.mu.RLock()
+	if resp, ok := s.usableCacheLocked(now); ok {
+		s.mu.RUnlock()
+		return resp, nil
+	}
+	stale := s.cachedResponse
+	staleAt := s.cachedAt
+	s.mu.RUnlock()
+
 	fresh, err := fetchStationboard(ctx, client, targetURL)
 	if err != nil {
-		if stale != nil {
+		errNow := s.nowFn()
+		s.mu.Lock()
+		s.lastErrAt = errNow
+		s.mu.Unlock()
+		if stale != nil && errNow.Sub(staleAt) <= s.maxStaleAge {
 			log.Printf("Transit fetch failed, using stale cache: %v", err)
 			return stale, nil
 		}
@@ -160,15 +189,30 @@ func (s *Service) Fetch(ctx context.Context) (*StationboardResponse, error) {
 	s.mu.Lock()
 	s.cachedResponse = fresh
 	s.cachedAt = s.nowFn()
+	s.lastErrAt = time.Time{}
 	s.mu.Unlock()
 
 	return fresh, nil
 }
 
+func (s *Service) usableCacheLocked(now time.Time) (*StationboardResponse, bool) {
+	if s.cachedResponse == nil {
+		return nil, false
+	}
+	age := now.Sub(s.cachedAt)
+	if age < s.cacheDuration {
+		return s.cachedResponse, true
+	}
+	if !s.lastErrAt.IsZero() && now.Sub(s.lastErrAt) < s.errorBackoff && age <= s.maxStaleAge {
+		return s.cachedResponse, true
+	}
+	return nil, false
+}
+
 // NextDepartures fetches and formats upcoming departures for each configured line.
 func (s *Service) NextDepartures(ctx context.Context, now time.Time, loc *time.Location) []LineDepartures {
 	lines := s.filter.Lines
-	if len(lines) == 0 {
+	if s.apiURL == "" || len(lines) == 0 {
 		return nil
 	}
 
@@ -218,8 +262,9 @@ func fetchStationboard(ctx context.Context, client *http.Client, targetURL strin
 }
 
 type candidate struct {
-	depTime time.Time
-	text    string
+	depTime       time.Time
+	effectiveTime time.Time
+	text          string
 }
 
 // FilterAndFormatDepartures filters trips and formats upcoming times per line up to opts.MaxDepartures.
@@ -264,18 +309,20 @@ func FilterAndFormatDepartures(items []StationboardItem, now time.Time, loc *tim
 		if err != nil {
 			continue
 		}
-		if !depTime.After(nowInLoc) {
+		effectiveTime := depTime
+		entryText := hhmm
+		if item.Stop.Delay != nil && *item.Stop.Delay > 0 {
+			effectiveTime = depTime.Add(time.Duration(*item.Stop.Delay) * time.Minute)
+			entryText = fmt.Sprintf("%s (+%d)", hhmm, *item.Stop.Delay)
+		}
+		if !effectiveTime.After(nowInLoc) {
 			continue
 		}
 
-		entryText := hhmm
-		if item.Stop.Delay != nil && *item.Stop.Delay > 0 {
-			entryText = fmt.Sprintf("%s (+%d)", hhmm, *item.Stop.Delay)
-		}
-
 		byLine[num] = append(byLine[num], candidate{
-			depTime: depTime,
-			text:    entryText,
+			depTime:       depTime,
+			effectiveTime: effectiveTime,
+			text:          entryText,
 		})
 	}
 
@@ -284,6 +331,9 @@ func FilterAndFormatDepartures(items []StationboardItem, now time.Time, loc *tim
 		trimmed := strings.TrimSpace(line)
 		cands := byLine[trimmed]
 		sort.Slice(cands, func(a, b int) bool {
+			if !cands[a].effectiveTime.Equal(cands[b].effectiveTime) {
+				return cands[a].effectiveTime.Before(cands[b].effectiveTime)
+			}
 			return cands[a].depTime.Before(cands[b].depTime)
 		})
 		out[i] = LineDepartures{
@@ -317,6 +367,9 @@ func parseDepartureTime(depStr string, depTs int64, now time.Time, loc *time.Loc
 				if pt, parseErr := time.ParseInLocation(f, depStr, loc); parseErr == nil {
 					nowInLoc := now.In(loc)
 					parsed = time.Date(nowInLoc.Year(), nowInLoc.Month(), nowInLoc.Day(), pt.Hour(), pt.Minute(), 0, 0, loc)
+					if nowInLoc.Sub(parsed) > 12*time.Hour {
+						parsed = parsed.AddDate(0, 0, 1)
+					}
 					err = nil
 					break
 				} else {

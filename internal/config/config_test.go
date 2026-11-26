@@ -56,12 +56,19 @@ func TestParseValidConfig(t *testing.T) {
 		t.Errorf("ContentPath = %q", cfg.ContentPath("2026-06-15"))
 	}
 
-	relCfg, err := Parse([]byte(`{"data_dir": "./data"}`), "/opt/brd")
+	relCfg, err := Parse([]byte(`{"data_dir": " ./data ", "local_addr": " 127.0.0.1:1234 ", "tailnet_addr": " :80 ", "chrome_path": " /usr/bin/chromium "}`), "/opt/brd")
 	if err != nil {
 		t.Fatalf("Parse relative data_dir failed: %v", err)
 	}
 	if relCfg.DataDir != "/opt/brd/data" {
 		t.Errorf("relative DataDir = %q, want /opt/brd/data", relCfg.DataDir)
+	}
+	if relCfg.LocalAddr != "127.0.0.1:1234" || relCfg.TailnetAddr != ":80" || relCfg.ChromePath != "/usr/bin/chromium" {
+		t.Errorf("trimmed addrs/chrome_path unexpected: local=%q tailnet=%q chrome=%q",
+			relCfg.LocalAddr, relCfg.TailnetAddr, relCfg.ChromePath)
+	}
+	if len(relCfg.Transit.Lines) != 0 {
+		t.Errorf("default Transit.Lines = %v, want empty", relCfg.Transit.Lines)
 	}
 	if relCfg.Transit.MaxDepartures != 4 {
 		t.Errorf("default Transit.MaxDepartures = %d, want 4", relCfg.Transit.MaxDepartures)

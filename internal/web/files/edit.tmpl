@@ -4,7 +4,7 @@
 	<meta charset="utf-8">
 	<meta name="viewport" content="width=device-width, initial-scale=1">
 	<title>Edit {{ .dateHeader }} — BRD</title>
-	<script src="https://cdn.ckeditor.com/ckeditor5/36.0.1/super-build/ckeditor.js"></script>
+	<script src="https://cdn.ckeditor.com/ckeditor5/41.4.2/super-build/ckeditor.js" integrity="sha384-rYSrhx9wCS96jy4mvIC0OXrQ2UwXLN2xvk3NpFt1QX88eNORTW8DkUT/uFBsNiko" crossorigin="anonymous"></script>
 	<style>
 		:root {
 			--color-bg: #18181b;
@@ -237,6 +237,17 @@
 			const form = document.getElementById("edit-form");
 			const saveBtn = document.getElementById("save-btn");
 			let submitting = false;
+			function resetSubmitState() {
+				submitting = false;
+				saveBtn.disabled = false;
+				saveBtn.removeAttribute("aria-busy");
+				saveBtn.textContent = "Save";
+			}
+			window.addEventListener("pageshow", function (event) {
+				if (event.persisted) {
+					resetSubmitState();
+				}
+			});
 			form.addEventListener("submit", function (event) {
 				if (submitting) {
 					event.preventDefault();
@@ -304,18 +315,8 @@
 					options: [ 28, 32, 36, 42, 'default', 54, 60, 66, 72 ],
 					supportAllValues: true
 				},
-				htmlSupport: {
-					allow: [
-						{
-							name: /.*/,
-							attributes: true,
-							classes: true,
-							styles: true
-						}
-					]
-				},
 				htmlEmbed: {
-					showPreviews: true
+					showPreviews: false
 				},
 				link: {
 					decorators: {
@@ -331,20 +332,32 @@
 					}
 				},
 				removePlugins: [
+					'AIAssistant',
 					'CKBox',
 					'CKFinder',
-					'EasyImage',
-					'RealTimeCollaborativeComments',
-					'RealTimeCollaborativeTrackChanges',
-					'RealTimeCollaborativeRevisionHistory',
-					'PresenceList',
+					'CaseChange',
 					'Comments',
+					'DocumentOutline',
+					'EasyImage',
+					'ExportPdf',
+					'ExportWord',
+					'FormatPainter',
+					'ImportWord',
+					'MathType',
+					'MultiLevelList',
+					'Pagination',
+					'PasteFromOfficeEnhanced',
+					'PresenceList',
+					'RealTimeCollaborativeComments',
+					'RealTimeCollaborativeRevisionHistory',
+					'RealTimeCollaborativeTrackChanges',
+					'RevisionHistory',
+					'SlashCommand',
+					'TableOfContents',
+					'Template',
 					'TrackChanges',
 					'TrackChangesData',
-					'RevisionHistory',
-					'Pagination',
-					'WProofreader',
-					'MathType'
+					'WProofreader'
 				]
 			}).catch(function (error) {
 				console.error(error);

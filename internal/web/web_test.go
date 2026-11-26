@@ -164,6 +164,9 @@ func TestEditorCanEditAndUpdateWithCSRFAndSanitization(t *testing.T) {
 	h := srv.Handler()
 
 	// Editor opens /edit
+	if err := os.WriteFile(cfg.ContentPath("2026-06-15"), []byte(`<p>Existing</p><script>evil()</script>`), 0600); err != nil {
+		t.Fatalf("seed note: %v", err)
+	}
 	editReq := httptest.NewRequest(http.MethodGet, "/edit?date=2026-06-15", nil)
 	editReq.Header.Set("X-Webauth-User", "editor@example.com")
 	editRR := httptest.NewRecorder()
@@ -184,12 +187,35 @@ func TestEditorCanEditAndUpdateWithCSRFAndSanitization(t *testing.T) {
 		`href="/?date=2026-06-15"`,
 		`:focus-visible`,
 		`prefers-reduced-motion`,
+		`ckeditor5/41.4.2/super-build/ckeditor.js`,
+		`integrity="sha384-`,
+		`crossorigin="anonymous"`,
+		`showPreviews: false`,
+		`pageshow`,
 	} {
 		if !strings.Contains(editBody, want) {
-			t.Errorf("GET /edit missing expected accessibility/layout marker %q", want)
+			t.Errorf("GET /edit missing expected accessibility/layout/security marker %q", want)
 		}
 	}
+	if strings.Contains(editBody, "evil()") {
+		t.Error("GET /edit rendered unsanitized script from note file")
+	}
 	csrf := extractCSRF(t, editBody)
+
+	// Another user (admin) cannot use editor's CSRF token.
+	crossForm := url.Values{
+		"date":       {"2026-06-15"},
+		"csrf_token": {csrf},
+		"contents":   {`<p>Hijack</p>`},
+	}
+	crossReq := httptest.NewRequest(http.MethodPost, "/update", strings.NewReader(crossForm.Encode()))
+	crossReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	crossReq.Header.Set("X-Webauth-User", "admin@example.com")
+	crossRR := httptest.NewRecorder()
+	h.ServeHTTP(crossRR, crossReq)
+	if crossRR.Code != http.StatusForbidden {
+		t.Errorf("cross-user CSRF status = %d, want 403", crossRR.Code)
+	}
 
 	// Editor posts /update with XSS payload
 	form := url.Values{
@@ -454,5 +480,20 @@ func assertSecurityHeaders(t *testing.T, label string, rr *httptest.ResponseReco
 		if got := rr.Header().Get(k); got != want {
 			t.Errorf("%s header %s = %q, want %q", label, k, got, want)
 		}
+	}
+}
+
+func TestCSRFTokenMapBounded(t *testing.T) {
+	srv, _ := newTestServer(t, &stubRegen{})
+	for i := 0; i < maxCSRFTokens+25; i++ {
+		if _, err := srv.issueCSRFTokenForUser("editor@example.com"); err != nil {
+			t.Fatalf("issueCSRFTokenForUser: %v", err)
+		}
+	}
+	srv.csrfMu.Lock()
+	gotLen := len(srv.csrfTokens)
+	srv.csrfMu.Unlock()
+	if gotLen > maxCSRFTokens {
+		t.Errorf("csrfTokens size = %d, want <= %d", gotLen, maxCSRFTokens)
 	}
 }

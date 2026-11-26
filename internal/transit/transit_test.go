@@ -194,3 +194,86 @@ func TestFilterAndFormatDeparturesMaxLimit(t *testing.T) {
 		})
 	}
 }
+
+func TestDelayedDepartureEffectiveTimeAndMidnightRollover(t *testing.T) {
+	zurich, err := time.LoadLocation("Europe/Zurich")
+	if err != nil {
+		t.Fatalf("load Europe/Zurich: %v", err)
+	}
+
+	// Scheduled 14:00 with +5 delay -> effective 14:05, still upcoming at 14:01.
+	// Scheduled 14:03 on time -> effective 14:03, sorts before 14:00 (+5).
+	now := time.Date(2026, 6, 15, 14, 1, 0, 0, zurich)
+	delay5 := 5
+	delay1 := 1
+	items := []StationboardItem{
+		{Number: "9", Stop: Stop{Departure: "2026-06-15T14:00:00+0200", Delay: &delay5}},
+		{Number: "9", Stop: Stop{Departure: "2026-06-15T14:03:00+0200"}},
+		{Number: "9", Stop: Stop{Departure: "2026-06-15T13:59:00+0200", Delay: &delay1}}, // effective 14:00 <= 14:01 -> dropped
+	}
+	got := FilterAndFormatDepartures(items, now, zurich, FilterOptions{Lines: []string{"9"}})
+	if len(got) != 1 || got[0].Next != "14:03, 14:00 (+5)" {
+		t.Errorf("delayed departures = %+v, want 14:03, 14:00 (+5)", got)
+	}
+
+	// "15:04" fallback across midnight: at 23:55, "00:05" rolls to next day; "23:50" stays past.
+	lateNow := time.Date(2026, 6, 15, 23, 55, 0, 0, zurich)
+	lateItems := []StationboardItem{
+		{Number: "14", Stop: Stop{Departure: "23:50"}},
+		{Number: "14", Stop: Stop{Departure: "00:05"}},
+	}
+	gotLate := FilterAndFormatDepartures(lateItems, lateNow, zurich, FilterOptions{Lines: []string{"14"}})
+	if len(gotLate) != 1 || gotLate[0].Next != "00:05" {
+		t.Errorf("midnight rollover = %+v, want 00:05", gotLate)
+	}
+}
+
+func TestServiceErrorBackoffMaxStaleAndUnconfigured(t *testing.T) {
+	// Unconfigured URL returns nil from NextDepartures even if lines are present.
+	emptySvc := NewService("", time.Minute, nil, FilterOptions{Lines: []string{"9"}})
+	if got := emptySvc.NextDepartures(context.Background(), time.Now(), time.UTC); got != nil {
+		t.Errorf("unconfigured NextDepartures = %+v, want nil", got)
+	}
+
+	var failMode atomic.Bool
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		if failMode.Load() {
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"stationboard":[{"number":9,"stop":{"departure":"2026-06-15T10:12:00Z"}}]}`))
+	}))
+	defer srv.Close()
+
+	now := time.Date(2026, 6, 15, 10, 0, 0, 0, time.UTC)
+	svc := NewService(srv.URL, 5*time.Minute, srv.Client(), FilterOptions{Lines: []string{"9"}})
+	svc.nowFn = func() time.Time { return now }
+
+	if _, err := svc.Fetch(context.Background()); err != nil {
+		t.Fatalf("initial Fetch: %v", err)
+	}
+
+	// Expire cache and trigger failure; subsequent calls within errorBackoff must not hammer upstream.
+	failMode.Store(true)
+	now = now.Add(10 * time.Minute)
+	if _, err := svc.Fetch(context.Background()); err != nil {
+		t.Fatalf("expected stale fallback on first error, got %v", err)
+	}
+	hitsAfterFirstErr := hits.Load()
+	now = now.Add(5 * time.Second)
+	if _, err := svc.Fetch(context.Background()); err != nil {
+		t.Fatalf("expected error backoff stale fallback, got %v", err)
+	}
+	if hits.Load() != hitsAfterFirstErr {
+		t.Errorf("upstream hits during backoff = %d, want %d", hits.Load(), hitsAfterFirstErr)
+	}
+
+	// Past maxStaleAge, error is returned instead of indefinitely stale data.
+	now = now.Add(3 * time.Hour)
+	if _, err := svc.Fetch(context.Background()); err == nil {
+		t.Error("expected error once cache exceeds maxStaleAge")
+	}
+}

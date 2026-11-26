@@ -139,10 +139,33 @@ func TestOAuthStateValidationAndExpiry(t *testing.T) {
 	if len(state) != oauthStateBytes*2 {
 		t.Fatalf("state len = %d, want %d", len(state), oauthStateBytes*2)
 	}
+	if locURL.Query().Get("code_challenge_method") != "S256" || locURL.Query().Get("code_challenge") == "" {
+		t.Errorf("expected PKCE S256 challenge in auth URL, got %q", locURL.RawQuery)
+	}
+	cookies := rr.Result().Cookies()
+	var stateCookie *http.Cookie
+	for _, c := range cookies {
+		if c.Name == oauthStateCookieName {
+			stateCookie = c
+			break
+		}
+	}
+	if stateCookie == nil || stateCookie.Value != state || !stateCookie.HttpOnly {
+		t.Fatalf("expected HttpOnly state cookie matching %q, got %+v", state, stateCookie)
+	}
+
+	// Valid state without cookie rejected
+	rrNoCookie := httptest.NewRecorder()
+	reqNoCookie := httptest.NewRequest(http.MethodGet, "/savetoken?state="+state+"&code=abc", nil)
+	svc.ProcessAuthCode(rrNoCookie, reqNoCookie)
+	if rrNoCookie.Code != http.StatusBadRequest {
+		t.Errorf("missing cookie status = %d, want 400", rrNoCookie.Code)
+	}
 
 	// Wrong state rejected
 	rrBad := httptest.NewRecorder()
 	reqBad := httptest.NewRequest(http.MethodGet, "/savetoken?state=wrong&code=abc", nil)
+	reqBad.AddCookie(stateCookie)
 	svc.ProcessAuthCode(rrBad, reqBad)
 	if rrBad.Code != http.StatusBadRequest {
 		t.Errorf("wrong state status = %d, want 400", rrBad.Code)
@@ -315,5 +338,64 @@ func TestCloseWaitsForRefreshLoopExit(t *testing.T) {
 	case <-done:
 	default:
 		t.Error("expected Close() to wait for refreshTokenLoop exit")
+	}
+}
+
+func TestDeterministicDeduplicationAndBoundedStates(t *testing.T) {
+	now := time.Date(2026, 6, 15, 10, 0, 0, 0, time.UTC)
+	fetcher := stubFetcher{
+		fn: func(calID, _, _ string) ([]*gcal.Event, error) {
+			if calID == "first@example.com" {
+				time.Sleep(15 * time.Millisecond) // Finish second to verify config order still wins.
+				return []*gcal.Event{
+					{Id: "shared", Summary: "Full Title", Start: &gcal.EventDateTime{Date: "2026-06-15"}},
+				}, nil
+			}
+			return []*gcal.Event{
+				{Id: "shared", Summary: "Busy", Start: &gcal.EventDateTime{Date: "2026-06-15"}},
+			}, nil
+		},
+	}
+
+	svc, err := NewService(context.Background(), Options{
+		Calendars: []string{"first@example.com", "second@example.com"},
+		Location:  time.UTC,
+		Now:       func() time.Time { return now },
+		Fetcher:   fetcher,
+	})
+	if err != nil {
+		t.Fatalf("NewService failed: %v", err)
+	}
+
+	events, err := svc.Events(context.Background(), now)
+	if err != nil {
+		t.Fatalf("Events failed: %v", err)
+	}
+	if len(events) != 1 || events[0].Summary != "Full Title" {
+		t.Errorf("dedup result = %+v, want first calendar's Full Title", events)
+	}
+
+	for i := 0; i < maxPendingStates+15; i++ {
+		if _, err := svc.issueState(); err != nil {
+			t.Fatalf("issueState: %v", err)
+		}
+	}
+	svc.stateMu.Lock()
+	gotStates := len(svc.pendingStates)
+	svc.stateMu.Unlock()
+	if gotStates > maxPendingStates {
+		t.Errorf("pendingStates size = %d, want <= %d", gotStates, maxPendingStates)
+	}
+
+	// Missing client_secret.json preserves startup error in Events().
+	missingSvc, err := NewService(context.Background(), Options{
+		Location:         time.UTC,
+		ClientSecretFile: filepath.Join(t.TempDir(), "missing.json"),
+	})
+	if err == nil {
+		t.Fatal("expected init error for missing client_secret.json")
+	}
+	if _, evErr := missingSvc.Events(context.Background(), now); evErr == nil || !strings.Contains(evErr.Error(), "read client secret file") {
+		t.Errorf("Events() error = %v, want preserved startup error", evErr)
 	}
 }

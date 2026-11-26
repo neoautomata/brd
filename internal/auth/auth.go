@@ -166,6 +166,17 @@ func (a *Authorizer) RequireEditor(next http.Handler) http.Handler {
 	return a.requireRole(next, false)
 }
 
+type userContextKey struct{}
+
+// UserFromContext returns the normalized authenticated user stored by Authorizer middleware.
+func UserFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	user, _ := ctx.Value(userContextKey{}).(string)
+	return user
+}
+
 func (a *Authorizer) requireRole(next http.Handler, adminOnly bool) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if a == nil || a.resolver == nil {
@@ -185,7 +196,8 @@ func (a *Authorizer) requireRole(next http.Handler, adminOnly bool) http.Handler
 			http.Error(w, "Forbidden", http.StatusForbidden)
 			return
 		}
-		next.ServeHTTP(w, r)
+		ctx := context.WithValue(r.Context(), userContextKey{}, normalizeUser(user))
+		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 

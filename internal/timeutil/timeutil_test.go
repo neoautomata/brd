@@ -187,6 +187,42 @@ func TestFormatElapsed(t *testing.T) {
 			now:  time.Date(2026, 1, 5, 10, 0, 0, 0, time.UTC),
 			want: "15d 19:00",
 		},
+		{
+			name: "DST fall-back 45 minutes elapsed",
+			t:    time.Date(2026, 10, 25, 0, 30, 0, 0, time.UTC).In(zurich), // 02:30 CEST (+0200)
+			now:  time.Date(2026, 10, 25, 1, 15, 0, 0, time.UTC).In(zurich), // 02:15 CET (+0100)
+			want: "00:45",
+		},
+		{
+			name: "DST fall-back 1 hour elapsed",
+			t:    time.Date(2026, 10, 25, 0, 30, 0, 0, time.UTC).In(zurich), // 02:30 CEST (+0200)
+			now:  time.Date(2026, 10, 25, 1, 30, 0, 0, time.UTC).In(zurich), // 02:30 CET (+0100)
+			want: "01:00",
+		},
+		{
+			name: "DST spring-forward 1 hour elapsed",
+			t:    time.Date(2026, 3, 29, 0, 30, 0, 0, time.UTC).In(zurich), // 01:30 CET (+0100)
+			now:  time.Date(2026, 3, 29, 1, 30, 0, 0, time.UTC).In(zurich), // 03:30 CEST (+0200)
+			want: "01:00",
+		},
+		{
+			name: "month-end Jan 31 to Mar 1 before noon has non-negative days",
+			t:    time.Date(2026, 1, 31, 12, 0, 0, 0, time.UTC),
+			now:  time.Date(2026, 3, 1, 11, 0, 0, 0, time.UTC),
+			want: "1m 0d 23:00",
+		},
+		{
+			name: "month-end Jan 31 to Mar 1 at noon",
+			t:    time.Date(2026, 1, 31, 12, 0, 0, 0, time.UTC),
+			now:  time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC),
+			want: "1m 1d 00:00",
+		},
+		{
+			name: "month-end Jan 31 to Feb 28 before noon",
+			t:    time.Date(2026, 1, 31, 12, 0, 0, 0, time.UTC),
+			now:  time.Date(2026, 2, 28, 11, 0, 0, 0, time.UTC),
+			want: "27d 23:00",
+		},
 	}
 
 	for _, tc := range tests {
