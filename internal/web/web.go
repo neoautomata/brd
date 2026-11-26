@@ -24,9 +24,11 @@ import (
 )
 
 const (
-	maxUpdateBodyBytes = 1 << 20 // 1 MiB
-	csrfTokenBytes     = 32
-	csrfTokenTTL       = 2 * time.Hour
+	maxUpdateBodyBytes   = 1 << 20 // 1 MiB
+	csrfTokenBytes       = 32
+	csrfTokenTTL         = 2 * time.Hour
+	maxUpdateHorizonDays = 365
+	updateRegenTimeout   = 25 * time.Second
 )
 
 //go:embed files/ckengine5.css
@@ -114,25 +116,29 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("/newtoken", s.authz.RequireAdmin(http.HandlerFunc(s.handleNewToken)))
 	mux.Handle("/savetoken", s.authz.RequireAdmin(http.HandlerFunc(s.handleSaveToken)))
 
-	mux.HandleFunc("/window_screenshot", s.serveDatedFile(0, s.cfg.WindowScreenshotPath))
-	mux.HandleFunc("/screenshot", s.serveDatedFile(0, s.cfg.ScreenshotPath))
-	mux.HandleFunc("/img", s.serveDatedFile(0, s.cfg.ImagePath))
-	mux.HandleFunc("/img.sha", s.serveDatedFile(0, s.cfg.HashPath))
+	mux.HandleFunc("/window_screenshot", s.serveDatedFile(0, "image/png", s.cfg.WindowScreenshotPath))
+	mux.HandleFunc("/screenshot", s.serveDatedFile(0, "image/png", s.cfg.ScreenshotPath))
+	mux.HandleFunc("/img", s.serveDatedFile(0, "application/octet-stream", s.cfg.ImagePath))
+	mux.HandleFunc("/img.sha", s.serveDatedFile(0, "text/plain; charset=utf-8", s.cfg.HashPath))
 
-	mux.HandleFunc("/screenshot2", s.serveDatedFile(1, s.cfg.ScreenshotPath))
-	mux.HandleFunc("/img2", s.serveDatedFile(1, s.cfg.ImagePath))
-	mux.HandleFunc("/img2.sha", s.serveDatedFile(1, s.cfg.HashPath))
+	mux.HandleFunc("/screenshot2", s.serveDatedFile(1, "image/png", s.cfg.ScreenshotPath))
+	mux.HandleFunc("/img2", s.serveDatedFile(1, "application/octet-stream", s.cfg.ImagePath))
+	mux.HandleFunc("/img2.sha", s.serveDatedFile(1, "text/plain; charset=utf-8", s.cfg.HashPath))
 
 	return mux
 }
 
 func (s *Server) handleCSS(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/css; charset=utf-8")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	http.ServeContent(w, r, "ckengine5.css", time.Time{}, bytes.NewReader(cssData))
 }
 
-func (s *Server) serveDatedFile(dayOffset int, pathFn func(string) string) http.HandlerFunc {
+func (s *Server) serveDatedFile(dayOffset int, contentType string, pathFn func(string) string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", contentType)
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
 		dateStr := s.nowFn().In(s.cfg.Location).AddDate(0, 0, dayOffset).Format("2006-01-02")
 		http.ServeFile(w, r, pathFn(dateStr))
 	}
@@ -245,6 +251,7 @@ func (s *Server) handleEdit(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
+	setDynamicSecurityHeaders(w)
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", http.MethodPost)
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -289,6 +296,12 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Cannot update prior days", http.StatusBadRequest)
 		return
 	}
+	todayMidnight := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, s.cfg.Location)
+	maxDate := todayMidnight.AddDate(0, 0, maxUpdateHorizonDays)
+	if parsed.After(maxDate) {
+		http.Error(w, "Cannot update dates more than 365 days ahead", http.StatusBadRequest)
+		return
+	}
 	validDate := parsed.Format("2006-01-02")
 
 	cleanHTML := sanitize.HTML(contents[0])
@@ -299,8 +312,12 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if s.regenerator != nil {
-		if err := s.regenerator.Regenerate(r.Context(), validDate); err != nil {
+	todayStr := todayMidnight.Format("2006-01-02")
+	tomorrowStr := todayMidnight.AddDate(0, 0, 1).Format("2006-01-02")
+	if s.regenerator != nil && (validDate == todayStr || validDate == tomorrowStr) {
+		regenCtx, cancel := context.WithTimeout(r.Context(), updateRegenTimeout)
+		defer cancel()
+		if err := s.regenerator.Regenerate(regenCtx, validDate); err != nil {
 			log.Printf("Regenerate image for %s failed: %v", validDate, err)
 			http.Error(w, "Failed to update display image", http.StatusInternalServerError)
 			return
@@ -311,6 +328,7 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleNewToken(w http.ResponseWriter, r *http.Request) {
+	setDynamicSecurityHeaders(w)
 	if s.cal == nil {
 		http.Error(w, "Calendar service unavailable", http.StatusInternalServerError)
 		return
@@ -319,6 +337,7 @@ func (s *Server) handleNewToken(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleSaveToken(w http.ResponseWriter, r *http.Request) {
+	setDynamicSecurityHeaders(w)
 	if s.cal == nil {
 		http.Error(w, "Calendar service unavailable", http.StatusInternalServerError)
 		return
@@ -384,6 +403,14 @@ func (s *Server) consumeCSRFToken(candidate string) bool {
 	return true
 }
 
+func setDynamicSecurityHeaders(w http.ResponseWriter) {
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("X-Frame-Options", "DENY")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	w.Header().Set("Content-Security-Policy", "frame-ancestors 'none'")
+}
+
 func renderTemplate(w http.ResponseWriter, tmpl *htmpl.Template, data map[string]any) {
 	var buf bytes.Buffer
 	if err := tmpl.Execute(&buf, data); err != nil {
@@ -392,6 +419,7 @@ func renderTemplate(w http.ResponseWriter, tmpl *htmpl.Template, data map[string
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	setDynamicSecurityHeaders(w)
 	_, _ = w.Write(buf.Bytes())
 }
 

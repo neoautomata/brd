@@ -3,6 +3,7 @@ package capture
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -13,8 +14,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/tebeka/selenium"
-	"github.com/tebeka/selenium/chrome"
+	"github.com/chromedp/chromedp"
 
 	"github.com/neoautomata/brd/internal/atomicfile"
 	"github.com/neoautomata/brd/internal/config"
@@ -22,22 +22,29 @@ import (
 )
 
 const (
+	captureTimeout     = 35 * time.Second
+	navigateTimeout    = 20 * time.Second
 	waitElementTimeout = 10 * time.Second
+	screenshotTimeout  = 10 * time.Second
+	closeGraceTimeout  = 5 * time.Second
 	widgetSettleDelay  = 1 * time.Second
 )
 
-// BrowserSession abstracts WebDriver calls needed to capture screenshots.
+// ErrServiceClosed indicates Regenerate was called after Service.Close.
+var ErrServiceClosed = errors.New("capture service is closed")
+
+// BrowserSession abstracts headless browser calls needed to capture screenshots.
 type BrowserSession interface {
-	Get(url string) error
-	WaitForElement(id string, timeout time.Duration) error
-	WindowScreenshot() ([]byte, error)
-	ElementScreenshot(id string) ([]byte, error)
+	Get(ctx context.Context, url string) error
+	WaitForElement(ctx context.Context, id string, timeout time.Duration) error
+	WindowScreenshot(ctx context.Context) ([]byte, error)
+	ElementScreenshot(ctx context.Context, id string) ([]byte, error)
 	Close() error
 }
 
-// BrowserFactory creates a BrowserSession and manages any driver subprocess.
+// BrowserFactory creates a BrowserSession and manages any browser resources.
 type BrowserFactory interface {
-	NewSession() (BrowserSession, error)
+	NewSession(ctx context.Context) (BrowserSession, error)
 	Close() error
 }
 
@@ -59,127 +66,119 @@ func (gc GoConverter) Convert(ctx context.Context, inputPNG, outputImg string) e
 	return imgconv.ConvertFile(inputPNG, outputImg, gc.Options)
 }
 
-// SeleniumFactory manages a headless ChromeDriver subprocess and sessions.
-type SeleniumFactory struct {
-	DriverPath string
-	Port       int
-
-	mu      sync.Mutex
-	service *selenium.Service
+// ChromedpFactory starts isolated headless Chromium sessions using Chrome DevTools Protocol.
+type ChromedpFactory struct {
+	ExecPath string
 }
 
-// NewSession opens a headless Chromium session, restarting ChromeDriver once if a prior service died.
-func (sf *SeleniumFactory) NewSession() (BrowserSession, error) {
-	if err := sf.ensureService(); err != nil {
+// NewSession starts a headless Chromium process bound to ctx and returns a BrowserSession.
+func (cf *ChromedpFactory) NewSession(ctx context.Context) (BrowserSession, error) {
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 
-	driver, err := sf.dialRemote()
-	if err != nil {
-		log.Printf("Selenium remote connect failed, restarting chromedriver: %v", err)
-		sf.resetService()
-		if startErr := sf.ensureService(); startErr != nil {
-			return nil, fmt.Errorf("restart chromedriver: %w", startErr)
-		}
-		driver, err = sf.dialRemote()
-		if err != nil {
-			return nil, fmt.Errorf("connect selenium remote after restart: %w", err)
-		}
+	opts := make([]chromedp.ExecAllocatorOption, 0, len(chromedp.DefaultExecAllocatorOptions)+6)
+	opts = append(opts, chromedp.DefaultExecAllocatorOptions[:]...)
+	opts = append(opts,
+		chromedp.WindowSize(1080, 1920),
+		chromedp.DisableGPU,
+		chromedp.NoSandbox,
+		chromedp.Flag("force-device-scale-factor", "1"),
+		chromedp.Flag("hide-scrollbars", true),
+	)
+	if cf.ExecPath != "" {
+		opts = append(opts, chromedp.ExecPath(cf.ExecPath))
 	}
-	return &seleniumSession{driver: driver}, nil
+
+	allocCtx, allocCancel := chromedp.NewExecAllocator(ctx, opts...)
+	tabCtx, tabCancel := chromedp.NewContext(allocCtx)
+
+	// Start the browser immediately on tabCtx so later per-step timeouts do not kill the browser.
+	if err := chromedp.Do(tabCtx); err != nil {
+		tabCancel()
+		allocCancel()
+		return nil, fmt.Errorf("start headless browser: %w", err)
+	}
+
+	return &chromedpSession{
+		tabCtx:      tabCtx,
+		tabCancel:   tabCancel,
+		allocCancel: allocCancel,
+	}, nil
 }
 
-// Close stops the running ChromeDriver service if active.
-func (sf *SeleniumFactory) Close() error {
-	sf.mu.Lock()
-	svc := sf.service
-	sf.service = nil
-	sf.mu.Unlock()
-	if svc != nil {
-		return svc.Stop()
-	}
+// Close satisfies BrowserFactory; per-session allocators clean up their own browser processes.
+func (cf *ChromedpFactory) Close() error {
 	return nil
 }
 
-func (sf *SeleniumFactory) ensureService() error {
-	sf.mu.Lock()
-	defer sf.mu.Unlock()
-	if sf.service != nil {
-		return nil
-	}
-	svc, err := selenium.NewChromeDriverService(sf.DriverPath, sf.Port)
-	if err != nil {
-		return fmt.Errorf("start chromedriver service: %w", err)
-	}
-	sf.service = svc
-	return nil
+type chromedpSession struct {
+	tabCtx      context.Context
+	tabCancel   context.CancelFunc
+	allocCancel context.CancelFunc
+	closeOnce   sync.Once
+	closeErr    error
 }
 
-func (sf *SeleniumFactory) resetService() {
-	sf.mu.Lock()
-	svc := sf.service
-	sf.service = nil
-	sf.mu.Unlock()
-	if svc != nil {
-		_ = svc.Stop()
+func (s *chromedpSession) stepContext(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	stepCtx, cancel := context.WithTimeout(s.tabCtx, timeout)
+	stop := context.AfterFunc(parent, cancel)
+	return stepCtx, func() {
+		stop()
+		cancel()
 	}
 }
 
-func (sf *SeleniumFactory) dialRemote() (selenium.WebDriver, error) {
-	caps := selenium.Capabilities{}
-	caps.AddChrome(chrome.Capabilities{Args: []string{
-		"--window-size=1080,1920",
-		"--no-sandbox",
-		"--disable-dev-shm-usage",
-		"--disable-gpu",
-		"--headless",
-	}})
-	urlPrefix := fmt.Sprintf("http://127.0.0.1:%d/wd/hub", sf.Port)
-	return selenium.NewRemote(caps, urlPrefix)
+func (s *chromedpSession) Get(ctx context.Context, targetURL string) error {
+	stepCtx, cancel := s.stepContext(ctx, navigateTimeout)
+	defer cancel()
+	return chromedp.Do(stepCtx, chromedp.Navigate(targetURL))
 }
 
-type seleniumSession struct {
-	driver selenium.WebDriver
+func (s *chromedpSession) WaitForElement(ctx context.Context, id string, timeout time.Duration) error {
+	stepCtx, cancel := s.stepContext(ctx, timeout)
+	defer cancel()
+	return chromedp.Do(stepCtx, chromedp.WaitVisible(chromedp.ID(id)))
 }
 
-func (s *seleniumSession) Get(targetURL string) error {
-	return s.driver.Get(targetURL)
+func (s *chromedpSession) WindowScreenshot(ctx context.Context) ([]byte, error) {
+	stepCtx, cancel := s.stepContext(ctx, screenshotTimeout)
+	defer cancel()
+	return chromedp.Run(stepCtx, chromedp.CaptureScreenshot())
 }
 
-func (s *seleniumSession) WaitForElement(id string, timeout time.Duration) error {
-	return s.driver.WaitWithTimeout(func(wd selenium.WebDriver) (bool, error) {
-		elem, err := wd.FindElement(selenium.ByID, id)
-		if err != nil {
-			return false, nil
+func (s *chromedpSession) ElementScreenshot(ctx context.Context, id string) ([]byte, error) {
+	stepCtx, cancel := s.stepContext(ctx, screenshotTimeout)
+	defer cancel()
+	return chromedp.Run(stepCtx, chromedp.Screenshot(chromedp.ID(id), chromedp.NodeVisible))
+}
+
+func (s *chromedpSession) Close() error {
+	s.closeOnce.Do(func() {
+		if s.tabCtx.Err() == nil {
+			graceCtx, graceCancel := context.WithTimeout(s.tabCtx, closeGraceTimeout)
+			s.closeErr = chromedp.Cancel(graceCtx)
+			graceCancel()
 		}
-		displayed, err := elem.IsDisplayed()
-		return displayed && err == nil, nil
-	}, timeout)
-}
-
-func (s *seleniumSession) WindowScreenshot() ([]byte, error) {
-	return s.driver.Screenshot()
-}
-
-func (s *seleniumSession) ElementScreenshot(id string) ([]byte, error) {
-	elem, err := s.driver.FindElement(selenium.ByID, id)
-	if err != nil {
-		return nil, err
-	}
-	return elem.Screenshot(true)
-}
-
-func (s *seleniumSession) Close() error {
-	return s.driver.Quit()
+		s.tabCancel()
+		s.allocCancel()
+	})
+	return s.closeErr
 }
 
 // Service serializes screenshot capture, image conversion, and retention cleanup.
 type Service struct {
-	cfg         *config.Config
-	viewBaseURL string
-	browsers    BrowserFactory
-	converter   Converter
-	settleDelay time.Duration
+	cfg            *config.Config
+	viewBaseURL    string
+	browsers       BrowserFactory
+	converter      Converter
+	settleDelay    time.Duration
+	captureTimeout time.Duration
+
+	stateMu   sync.Mutex
+	closed    bool
+	svcCtx    context.Context
+	svcCancel context.CancelFunc
 
 	mu sync.Mutex
 }
@@ -187,20 +186,23 @@ type Service struct {
 // NewService constructs a capture Service using the given configuration and dependencies.
 func NewService(cfg *config.Config, browsers BrowserFactory, converter Converter) *Service {
 	if browsers == nil {
-		browsers = &SeleniumFactory{
-			DriverPath: cfg.ChromeDriverPath,
-			Port:       cfg.ChromeDriverPort,
+		browsers = &ChromedpFactory{
+			ExecPath: cfg.ChromePath,
 		}
 	}
 	if converter == nil {
 		converter = GoConverter{}
 	}
+	svcCtx, svcCancel := context.WithCancel(context.Background())
 	return &Service{
-		cfg:         cfg,
-		viewBaseURL: buildViewBaseURL(cfg.LocalAddr),
-		browsers:    browsers,
-		converter:   converter,
-		settleDelay: widgetSettleDelay,
+		cfg:            cfg,
+		viewBaseURL:    buildViewBaseURL(cfg.LocalAddr),
+		browsers:       browsers,
+		converter:      converter,
+		settleDelay:    widgetSettleDelay,
+		captureTimeout: captureTimeout,
+		svcCtx:         svcCtx,
+		svcCancel:      svcCancel,
 	}
 }
 
@@ -215,9 +217,28 @@ func buildViewBaseURL(localAddr string) string {
 	return "http://" + net.JoinHostPort(host, port)
 }
 
-// Close releases underlying browser driver resources.
+func (s *Service) isClosed() bool {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	return s.closed
+}
+
+// Close cancels any active capture, waits for it to release resources, and closes the browser factory.
 func (s *Service) Close() error {
-	if s == nil || s.browsers == nil {
+	if s == nil {
+		return nil
+	}
+	s.stateMu.Lock()
+	s.closed = true
+	cancel := s.svcCancel
+	s.stateMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.browsers == nil {
 		return nil
 	}
 	return s.browsers.Close()
@@ -228,34 +249,60 @@ func (s *Service) Regenerate(ctx context.Context, dateStr string) error {
 	if _, err := time.Parse("2006-01-02", dateStr); err != nil {
 		return fmt.Errorf("invalid date %q: %w", dateStr, err)
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if s.isClosed() {
+		return ErrServiceClosed
+	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	session, err := s.browsers.NewSession()
+	if s.isClosed() {
+		return ErrServiceClosed
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	runCtx, cancelRun := context.WithTimeout(ctx, s.captureTimeout)
+	stopSvcCancel := context.AfterFunc(s.svcCtx, cancelRun)
+	defer func() {
+		stopSvcCancel()
+		cancelRun()
+	}()
+
+	session, err := s.browsers.NewSession(runCtx)
 	if err != nil {
 		return fmt.Errorf("open browser session: %w", err)
 	}
-	defer session.Close()
+	defer func() {
+		if closeErr := session.Close(); closeErr != nil && !errors.Is(closeErr, context.Canceled) {
+			log.Printf("Close browser session failed: %v", closeErr)
+		}
+	}()
 
 	targetURL := fmt.Sprintf("%s/?date=%s", s.viewBaseURL, dateStr)
-	if err := session.Get(targetURL); err != nil {
+	if err := session.Get(runCtx, targetURL); err != nil {
 		return fmt.Errorf("navigate to view URL: %w", err)
 	}
 
-	if err := session.WaitForElement("screenshot_content", waitElementTimeout); err != nil {
+	if err := session.WaitForElement(runCtx, "screenshot_content", waitElementTimeout); err != nil {
 		return fmt.Errorf("wait for screenshot_content: %w", err)
 	}
 
 	if s.settleDelay > 0 {
+		timer := time.NewTimer(s.settleDelay)
 		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(s.settleDelay):
+		case <-runCtx.Done():
+			timer.Stop()
+			return runCtx.Err()
+		case <-timer.C:
 		}
 	}
 
-	winPNG, err := session.WindowScreenshot()
+	winPNG, err := session.WindowScreenshot(runCtx)
 	if err != nil {
 		return fmt.Errorf("capture window screenshot: %w", err)
 	}
@@ -263,7 +310,7 @@ func (s *Service) Regenerate(ctx context.Context, dateStr string) error {
 		return fmt.Errorf("write window screenshot: %w", err)
 	}
 
-	elemPNG, err := session.ElementScreenshot("screenshot_content")
+	elemPNG, err := session.ElementScreenshot(runCtx, "screenshot_content")
 	if err != nil {
 		return fmt.Errorf("capture element screenshot: %w", err)
 	}
@@ -273,7 +320,7 @@ func (s *Service) Regenerate(ctx context.Context, dateStr string) error {
 	}
 
 	imgPath := s.cfg.ImagePath(dateStr)
-	if err := s.converter.Convert(ctx, screenshotPath, imgPath); err != nil {
+	if err := s.converter.Convert(runCtx, screenshotPath, imgPath); err != nil {
 		return fmt.Errorf("convert screenshot: %w", err)
 	}
 

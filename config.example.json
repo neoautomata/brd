@@ -6,8 +6,7 @@
   "local_addr": "127.0.0.1:1234",
   "trust_webauth_header": true,
   "trusted_proxy_tags": [],
-  "chromedriver_path": "/usr/bin/chromedriver",
-  "chromedriver_port": 4444,
+  "chrome_path": "",
   "regen_interval_seconds": 300,
   "retention_days": 7,
   "admin_users": [

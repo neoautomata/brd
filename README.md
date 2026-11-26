@@ -23,8 +23,9 @@ flowchart LR
 ```
 
 > [!NOTE]
-> The display connects over local HTTP for `/img` and `/img.sha`.
-> Editors and administrators reach `/edit`, `/update`, `/newtoken`, and `/savetoken` through a reverse proxy (local or Tailscale) or directly over Tailscale.
+> The server listens on `local_addr` (`127.0.0.1`) for loopback access (headless Chromium) and on the Tailscale `tsnet` listener (`tailnet_addr`) for network traffic.
+> In deployment, a reverse proxy forwards requests to the Tailscale address.
+> The display fetches `/img` and `/img.sha` over the local network, and editors or administrators access editor routes through that proxy.
 
 ## Go Server
 
@@ -41,7 +42,7 @@ The server lives in `cmd/brd` and `internal/*` under module `github.com/neoautom
 | `internal/sanitize` | Allowlist HTML sanitizer for CKEditor note submissions |
 | `internal/calendar` | Google Calendar OAuth2 flow, atomic token storage, and event HTML rendering |
 | `internal/transit` | Cached stationboard HTTP client with stale fallback and departure formatting |
-| `internal/capture` | Headless ChromeDriver screenshot orchestration, 4bpp conversion, and file retention |
+| `internal/capture` | Headless Chromium (`chromedp`) screenshot orchestration, 4bpp conversion, and file retention |
 | `internal/imgconv` | Pure-Go 540x960 center-crop, ITU-R 601-2 grayscale, 90° CCW rotation, and 4bpp packing |
 | `internal/atomicfile` | Synced temporary-file and rename helper for atomic writes |
 | `internal/web` | Dedicated HTTP router, embedded templates, CSRF protection, and asset handlers |
@@ -79,8 +80,7 @@ cp config.example.json config.json
 | `local_addr` | `"127.0.0.1:1234"` | Loopback address for headless Chromium, local HTTP, and optional local proxy traffic |
 | `trust_webauth_header` | `false` | Accept `X-Webauth-User` from a local or Tailscale reverse proxy |
 | `trusted_proxy_tags` | `[]` | Restrict `X-Webauth-User` on the Tailscale listener to peers with these `tag:*` ACL tags |
-| `chromedriver_path` | `"/usr/bin/chromedriver"` | Path to the ChromeDriver binary |
-| `chromedriver_port` | `4444` | Loopback port for ChromeDriver |
+| `chrome_path` | `""` | Optional path to the Chromium or Chrome binary (auto-detected when empty) |
 | `regen_interval_seconds` | `300` | Seconds between scheduled screenshot regenerations |
 | `retention_days` | `7` | Days to retain dated notes, screenshots, and images |
 | `admin_users` | `[]` | Email addresses allowed to edit notes and refresh OAuth2 tokens |
@@ -90,12 +90,15 @@ cp config.example.json config.json
 | `weather_widget_html` | `""` | Optional HTML snippet for the weather widget inside `#screenshot_content` |
 
 > [!IMPORTANT]
-> On the Tailscale listener, `trusted_proxy_tags` restricts `X-Webauth-User` to tagged proxy peers while other peers use `WhoIs`.
-> On `local_addr`, bind to loopback so only a local reverse proxy can send `X-Webauth-User`.
+> When `trust_webauth_header` is `true` and `trusted_proxy_tags` is empty (`[]`), the Tailscale listener accepts `X-Webauth-User` from any reachable Tailscale peer before checking `WhoIs`.
+> Use this setting only when Tailscale ACLs allow only the reverse proxy to reach the server.
+> Configure the reverse proxy to strip or overwrite client `X-Webauth-User` headers.
+> If other Tailscale peers can connect directly, set `trusted_proxy_tags` so only tagged proxy peers send `X-Webauth-User` while other peers authenticate through `WhoIs`.
+> Keep `local_addr` bound to loopback (`127.0.0.1`) so external hosts cannot reach the local listener or spoof `X-Webauth-User`.
 
 ### Server Build and Test
 
-Install Go 1.27 or later, Chromium, and `chromium-driver`.
+Install Go 1.27 or later and Chromium (or Chrome).
 
 Run unit and race tests across all Go packages:
 
@@ -171,6 +174,8 @@ g++ -std=c++20 -O2 -Wall -Wextra -Werror -fsanitize=thread -pthread \
 - Keep OAuth2 secrets (`client_secret.json`, `token.json`) inside `data_dir` with `0600` permissions.
 - Store WiFi and device admin passwords in `secrets.yaml`, outside version control.
 - Bind the local HTTP server to `127.0.0.1` so unauthenticated local endpoints stay off external interfaces.
+- Restrict access to the Tailscale listener with Tailscale ACLs when `trust_webauth_header` is `true` and `trusted_proxy_tags` is empty.
+- Configure the reverse proxy to strip or overwrite client-supplied `X-Webauth-User` headers and to expose only `/img` and `/img.sha` to the display network.
 - Sanitize all CKEditor note HTML before storing and rendering it.
 - Enforce single-use CSRF tokens on `/update` and single-use OAuth2 state tokens on `/savetoken`.
 

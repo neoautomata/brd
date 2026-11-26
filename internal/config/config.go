@@ -18,8 +18,6 @@ const (
 	defaultTailnetHostname      = "brd"
 	defaultTailnetAddr          = ":80"
 	defaultLocalAddr            = "127.0.0.1:1234"
-	defaultChromeDriverPath     = "/usr/bin/chromedriver"
-	defaultChromeDriverPort     = 4444
 	defaultRegenIntervalSeconds = 300
 	defaultRetentionDays        = 7
 	defaultTransitCacheSeconds  = 600
@@ -50,6 +48,7 @@ type Config struct {
 	LocalAddr            string        `json:"local_addr"`
 	TrustWebAuthHeader   bool          `json:"trust_webauth_header"`
 	TrustedProxyTags     []string      `json:"trusted_proxy_tags"`
+	ChromePath           string        `json:"chrome_path"`
 	ChromeDriverPath     string        `json:"chromedriver_path"`
 	ChromeDriverPort     int           `json:"chromedriver_port"`
 	RegenIntervalSeconds int           `json:"regen_interval_seconds"`
@@ -87,8 +86,6 @@ func Parse(data []byte, baseDir string) (*Config, error) {
 		TailnetHostname:      defaultTailnetHostname,
 		TailnetAddr:          defaultTailnetAddr,
 		LocalAddr:            defaultLocalAddr,
-		ChromeDriverPath:     defaultChromeDriverPath,
-		ChromeDriverPort:     defaultChromeDriverPort,
 		RegenIntervalSeconds: defaultRegenIntervalSeconds,
 		RetentionDays:        defaultRetentionDays,
 		Transit: TransitConfig{
@@ -142,12 +139,22 @@ func (c *Config) validateAndNormalize(baseDir string) error {
 		return err
 	}
 
-	if err := validatePathString("chromedriver_path", c.ChromeDriverPath); err != nil {
-		return err
+	if trimmed := strings.TrimSpace(c.ChromePath); trimmed != "" {
+		if err := validatePathString("chrome_path", trimmed); err != nil {
+			return err
+		}
+		c.ChromePath = filepath.Clean(trimmed)
+	} else {
+		c.ChromePath = ""
 	}
-	c.ChromeDriverPath = filepath.Clean(c.ChromeDriverPath)
 
-	if c.ChromeDriverPort < 1 || c.ChromeDriverPort > 65535 {
+	if trimmed := strings.TrimSpace(c.ChromeDriverPath); trimmed != "" {
+		if err := validatePathString("chromedriver_path", trimmed); err != nil {
+			return err
+		}
+		c.ChromeDriverPath = filepath.Clean(trimmed)
+	}
+	if c.ChromeDriverPort != 0 && (c.ChromeDriverPort < 1 || c.ChromeDriverPort > 65535) {
 		return fmt.Errorf("chromedriver_port %d is out of range", c.ChromeDriverPort)
 	}
 	if c.RegenIntervalSeconds <= 0 {

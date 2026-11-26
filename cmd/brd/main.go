@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -150,7 +151,30 @@ func run() error {
 		}
 	}()
 
-	runRegenCycle(rootCtx, cfg, captureSvc)
+	regenTrigger := make(chan struct{}, 1)
+	var regenWG sync.WaitGroup
+	regenWG.Add(1)
+	go func() {
+		defer regenWG.Done()
+		for {
+			select {
+			case <-rootCtx.Done():
+				return
+			case <-regenTrigger:
+				runRegenCycle(rootCtx, cfg, captureSvc)
+			}
+		}
+	}()
+
+	triggerRegen := func() {
+		select {
+		case regenTrigger <- struct{}{}:
+		default:
+		}
+	}
+
+	// Queue initial image generation without blocking signal or startup error handling.
+	triggerRegen()
 
 	ticker := time.NewTicker(cfg.RegenInterval())
 	defer ticker.Stop()
@@ -160,13 +184,22 @@ func run() error {
 		select {
 		case <-rootCtx.Done():
 			log.Print("Shutdown signal received")
+			if err := captureSvc.Close(); err != nil {
+				log.Printf("Stop browser capture failed: %v", err)
+			}
+			regenWG.Wait()
 			shutdownServers(tailnetHTTP, localHTTP)
 			return nil
 		case srvErr := <-errChan:
+			stopSignals()
+			if err := captureSvc.Close(); err != nil {
+				log.Printf("Stop browser capture failed: %v", err)
+			}
+			regenWG.Wait()
 			shutdownServers(tailnetHTTP, localHTTP)
 			return srvErr
 		case <-ticker.C:
-			runRegenCycle(rootCtx, cfg, captureSvc)
+			triggerRegen()
 		}
 	}
 }
@@ -207,15 +240,30 @@ func newHTTPServer(handler http.Handler) *http.Server {
 }
 
 func runRegenCycle(ctx context.Context, cfg *config.Config, captureSvc *capture.Service) {
+	if ctx.Err() != nil {
+		return
+	}
 	now := time.Now().In(cfg.Location)
 	today := now.Format("2006-01-02")
 	tomorrow := now.AddDate(0, 0, 1).Format("2006-01-02")
 
 	if err := captureSvc.Regenerate(ctx, today); err != nil {
+		if ctx.Err() != nil {
+			return
+		}
 		log.Printf("Regenerate image for %s failed: %v", today, err)
 	}
+	if ctx.Err() != nil {
+		return
+	}
 	if err := captureSvc.Regenerate(ctx, tomorrow); err != nil {
+		if ctx.Err() != nil {
+			return
+		}
 		log.Printf("Regenerate image for %s failed: %v", tomorrow, err)
+	}
+	if ctx.Err() != nil {
+		return
 	}
 	captureSvc.CleanupOldFiles(now)
 }

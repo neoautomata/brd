@@ -105,6 +105,10 @@ func TestViewComputesServerLinksAndPreservesDimensions(t *testing.T) {
 	if rr.Code != http.StatusOK {
 		t.Fatalf("GET / status = %d, want 200", rr.Code)
 	}
+	assertSecurityHeaders(t, "GET /", rr)
+	if ct := rr.Header().Get("Content-Type"); ct != "text/html; charset=utf-8" {
+		t.Errorf("GET / Content-Type = %q, want text/html; charset=utf-8", ct)
+	}
 	body := rr.Body.String()
 	if !strings.HasPrefix(body, "<!DOCTYPE html>") {
 		t.Error("expected <!DOCTYPE html> prefix")
@@ -167,6 +171,7 @@ func TestEditorCanEditAndUpdateWithCSRFAndSanitization(t *testing.T) {
 	if editRR.Code != http.StatusOK {
 		t.Fatalf("editor GET /edit status = %d, want 200", editRR.Code)
 	}
+	assertSecurityHeaders(t, "GET /edit", editRR)
 	editBody := editRR.Body.String()
 	for _, want := range []string{
 		`<!DOCTYPE html>`,
@@ -324,17 +329,19 @@ func TestAssetRoutes(t *testing.T) {
 	}
 
 	routes := []struct {
-		path string
-		want string
+		path        string
+		want        string
+		wantCT      string
+		wantNoStore bool
 	}{
-		{"/img", "img-today"},
-		{"/img.sha", "sha-today"},
-		{"/img2", "img-tomorrow"},
-		{"/img2.sha", "sha-tomorrow"},
-		{"/screenshot", "png-today"},
-		{"/screenshot2", "png-tomorrow"},
-		{"/window_screenshot", "win-today"},
-		{"/ckengine5.css", ".ck-content"},
+		{"/img", "img-today", "application/octet-stream", true},
+		{"/img.sha", "sha-today", "text/plain; charset=utf-8", true},
+		{"/img2", "img-tomorrow", "application/octet-stream", true},
+		{"/img2.sha", "sha-tomorrow", "text/plain; charset=utf-8", true},
+		{"/screenshot", "png-today", "image/png", true},
+		{"/screenshot2", "png-tomorrow", "image/png", true},
+		{"/window_screenshot", "win-today", "image/png", true},
+		{"/ckengine5.css", ".ck-content", "text/css; charset=utf-8", false},
 	}
 
 	for _, tc := range routes {
@@ -345,6 +352,107 @@ func TestAssetRoutes(t *testing.T) {
 		}
 		if !strings.Contains(rr.Body.String(), tc.want) {
 			t.Errorf("GET %s body = %q, want substring %q", tc.path, rr.Body.String(), tc.want)
+		}
+		if gotCT := rr.Header().Get("Content-Type"); gotCT != tc.wantCT {
+			t.Errorf("GET %s Content-Type = %q, want %q", tc.path, gotCT, tc.wantCT)
+		}
+		if gotNoSniff := rr.Header().Get("X-Content-Type-Options"); gotNoSniff != "nosniff" {
+			t.Errorf("GET %s X-Content-Type-Options = %q, want nosniff", tc.path, gotNoSniff)
+		}
+		if tc.wantNoStore && rr.Header().Get("Cache-Control") != "no-store" {
+			t.Errorf("GET %s Cache-Control = %q, want no-store", tc.path, rr.Header().Get("Cache-Control"))
+		}
+	}
+}
+
+func TestUpdateFutureDateHorizonAndSelectiveRegen(t *testing.T) {
+	regen := &stubRegen{}
+	srv, cfg := newTestServer(t, regen)
+	h := srv.Handler()
+
+	// Date more than 365 days ahead is rejected with 400.
+	csrf1, err := srv.issueCSRFToken()
+	if err != nil {
+		t.Fatalf("issueCSRFToken: %v", err)
+	}
+	farForm := url.Values{
+		"date":       {"2028-01-01"},
+		"csrf_token": {csrf1},
+		"contents":   {"<p>Far future</p>"},
+	}
+	farReq := httptest.NewRequest(http.MethodPost, "/update", strings.NewReader(farForm.Encode()))
+	farReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	farReq.Header.Set("X-Webauth-User", "editor@example.com")
+	farRR := httptest.NewRecorder()
+	h.ServeHTTP(farRR, farReq)
+	if farRR.Code != http.StatusBadRequest {
+		t.Fatalf("far-future POST /update status = %d, want 400", farRR.Code)
+	}
+	if regen.calledDate != "" {
+		t.Errorf("expected no regeneration for rejected date, got %q", regen.calledDate)
+	}
+
+	// Date 5 days ahead saves note without triggering browser regeneration.
+	csrf2, err := srv.issueCSRFToken()
+	if err != nil {
+		t.Fatalf("issueCSRFToken: %v", err)
+	}
+	nextWeekForm := url.Values{
+		"date":       {"2026-06-20"},
+		"csrf_token": {csrf2},
+		"contents":   {"<p>Next week</p>"},
+	}
+	nwReq := httptest.NewRequest(http.MethodPost, "/update", strings.NewReader(nextWeekForm.Encode()))
+	nwReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	nwReq.Header.Set("X-Webauth-User", "editor@example.com")
+	nwRR := httptest.NewRecorder()
+	h.ServeHTTP(nwRR, nwReq)
+	if nwRR.Code != http.StatusSeeOther {
+		t.Fatalf("next-week POST /update status = %d, want 303", nwRR.Code)
+	}
+	if regen.calledDate != "" {
+		t.Errorf("expected no regeneration for date > tomorrow, got %q", regen.calledDate)
+	}
+	saved, err := os.ReadFile(cfg.ContentPath("2026-06-20"))
+	if err != nil || !strings.Contains(string(saved), "<p>Next week</p>") {
+		t.Errorf("expected next-week note saved, err=%v content=%q", err, string(saved))
+	}
+
+	// Tomorrow triggers regeneration.
+	csrf3, err := srv.issueCSRFToken()
+	if err != nil {
+		t.Fatalf("issueCSRFToken: %v", err)
+	}
+	tmrForm := url.Values{
+		"date":       {"2026-06-16"},
+		"csrf_token": {csrf3},
+		"contents":   {"<p>Tomorrow</p>"},
+	}
+	tmrReq := httptest.NewRequest(http.MethodPost, "/update", strings.NewReader(tmrForm.Encode()))
+	tmrReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	tmrReq.Header.Set("X-Webauth-User", "editor@example.com")
+	tmrRR := httptest.NewRecorder()
+	h.ServeHTTP(tmrRR, tmrReq)
+	if tmrRR.Code != http.StatusSeeOther {
+		t.Fatalf("tomorrow POST /update status = %d, want 303", tmrRR.Code)
+	}
+	if regen.calledDate != "2026-06-16" {
+		t.Errorf("regenerator date = %q, want 2026-06-16", regen.calledDate)
+	}
+}
+
+func assertSecurityHeaders(t *testing.T, label string, rr *httptest.ResponseRecorder) {
+	t.Helper()
+	wants := map[string]string{
+		"Cache-Control":           "no-store",
+		"X-Content-Type-Options":  "nosniff",
+		"X-Frame-Options":         "DENY",
+		"Referrer-Policy":         "no-referrer",
+		"Content-Security-Policy": "frame-ancestors 'none'",
+	}
+	for k, want := range wants {
+		if got := rr.Header().Get(k); got != want {
+			t.Errorf("%s header %s = %q, want %q", label, k, got, want)
 		}
 	}
 }

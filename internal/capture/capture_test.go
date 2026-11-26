@@ -9,7 +9,10 @@ import (
 	"image"
 	"image/color"
 	"image/png"
+	"net/http"
+	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 	"time"
@@ -26,21 +29,44 @@ type fakeSession struct {
 	gotURL     string
 	waitedID   string
 	capturedID string
+	blockOnGet chan struct{}
+	getStarted chan struct{}
 }
 
-func (f *fakeSession) Get(url string) error {
+func (f *fakeSession) Get(ctx context.Context, url string) error {
 	f.gotURL = url
+	if f.getStarted != nil {
+		close(f.getStarted)
+	}
+	if f.blockOnGet != nil {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-f.blockOnGet:
+		}
+	}
 	return f.getErr
 }
 
-func (f *fakeSession) WaitForElement(id string, _ time.Duration) error {
+func (f *fakeSession) WaitForElement(ctx context.Context, id string, _ time.Duration) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	f.waitedID = id
 	return f.waitErr
 }
 
-func (f *fakeSession) WindowScreenshot() ([]byte, error) { return f.winPNG, nil }
+func (f *fakeSession) WindowScreenshot(ctx context.Context) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return f.winPNG, nil
+}
 
-func (f *fakeSession) ElementScreenshot(id string) ([]byte, error) {
+func (f *fakeSession) ElementScreenshot(ctx context.Context, id string) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	f.capturedID = id
 	return f.elemPNG, nil
 }
@@ -53,7 +79,10 @@ type fakeFactory struct {
 	closed  bool
 }
 
-func (f *fakeFactory) NewSession() (BrowserSession, error) {
+func (f *fakeFactory) NewSession(ctx context.Context) (BrowserSession, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -111,6 +140,7 @@ func TestRegenerateWritesFilesAndFallbackHash(t *testing.T) {
 	}
 	factory := &fakeFactory{session: sess}
 	svc := NewService(cfg, factory, fakeConverter{writeSha: false})
+	defer svc.Close()
 	svc.settleDelay = 0
 
 	if err := svc.Regenerate(context.Background(), "2026-06-15"); err != nil {
@@ -138,6 +168,7 @@ func TestRegeneratePropagatesWaitErrorAndInvalidDate(t *testing.T) {
 	cfg := newTestConfig(t)
 	sess := &fakeSession{waitErr: errors.New("element timeout")}
 	svc := NewService(cfg, &fakeFactory{session: sess}, fakeConverter{writeSha: true})
+	defer svc.Close()
 	svc.settleDelay = 0
 
 	if err := svc.Regenerate(context.Background(), "bad-date"); err == nil {
@@ -148,9 +179,49 @@ func TestRegeneratePropagatesWaitErrorAndInvalidDate(t *testing.T) {
 	}
 }
 
+func TestRegenerateRespectsContextCancellationAndClose(t *testing.T) {
+	cfg := newTestConfig(t)
+	sess := &fakeSession{
+		blockOnGet: make(chan struct{}),
+		getStarted: make(chan struct{}),
+	}
+	factory := &fakeFactory{session: sess}
+	svc := NewService(cfg, factory, fakeConverter{writeSha: true})
+	svc.settleDelay = 0
+
+	// Cancelled caller context fails immediately before touching the factory.
+	cancelledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := svc.Regenerate(cancelledCtx, "2026-06-15"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled Regenerate err = %v, want context.Canceled", err)
+	}
+
+	// Service.Close cancels an active capture and rejects subsequent Regenerate calls.
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- svc.Regenerate(context.Background(), "2026-06-15")
+	}()
+
+	<-sess.getStarted
+	if err := svc.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+	if !factory.closed {
+		t.Error("expected factory.Close() to be called")
+	}
+
+	if err := <-errCh; !errors.Is(err, context.Canceled) {
+		t.Errorf("in-flight Regenerate err after Close = %v, want context.Canceled", err)
+	}
+	if err := svc.Regenerate(context.Background(), "2026-06-15"); !errors.Is(err, ErrServiceClosed) {
+		t.Errorf("post-Close Regenerate err = %v, want ErrServiceClosed", err)
+	}
+}
+
 func TestCleanupOldFiles(t *testing.T) {
 	cfg := newTestConfig(t)
 	svc := NewService(cfg, &fakeFactory{}, fakeConverter{})
+	defer svc.Close()
 
 	oldFile := filepath.Join(cfg.ContentsDir(), "2026-06-01.html")
 	newFile := filepath.Join(cfg.ContentsDir(), "2026-06-14.html")
@@ -209,6 +280,7 @@ func TestRegenerateWithGoConverterEndToEnd(t *testing.T) {
 		elemPNG: buf.Bytes(),
 	}
 	svc := NewService(cfg, &fakeFactory{session: sess}, nil)
+	defer svc.Close()
 	svc.settleDelay = 0
 
 	if err := svc.Regenerate(context.Background(), "2026-06-15"); err != nil {
@@ -233,5 +305,59 @@ func TestRegenerateWithGoConverterEndToEnd(t *testing.T) {
 	wantSha := fmt.Sprintf("%x", sha256.Sum256(raw))
 	if string(shaBytes) != wantSha {
 		t.Errorf("sha = %q, want %q", string(shaBytes), wantSha)
+	}
+}
+
+func TestChromedpFactoryRealCapture(t *testing.T) {
+	browserBin := ""
+	for _, name := range []string{"chromium", "chromium-browser", "google-chrome"} {
+		if p, err := exec.LookPath(name); err == nil {
+			browserBin = p
+			break
+		}
+	}
+	if browserBin == "" {
+		t.Skip("no chromium/chrome binary available in PATH")
+	}
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = fmt.Fprint(w, `<!DOCTYPE html><html><body style="margin:0;padding:0;">`+
+			`<div id="screenshot_content" style="width:540px;height:960px;background:#ffffff;color:#000000;">`+
+			`<h1>brd chromedp test</h1></div></body></html>`)
+	}))
+	defer ts.Close()
+
+	cfg := newTestConfig(t)
+	cfg.ChromePath = browserBin
+	svc := NewService(cfg, nil, nil)
+	defer svc.Close()
+	svc.viewBaseURL = ts.URL
+	svc.settleDelay = 0
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if err := svc.Regenerate(ctx, "2026-06-15"); err != nil {
+		t.Fatalf("real chromedp Regenerate failed: %v", err)
+	}
+
+	elemBytes, err := os.ReadFile(cfg.ScreenshotPath("2026-06-15"))
+	if err != nil {
+		t.Fatalf("read element screenshot: %v", err)
+	}
+	elemImg, err := png.Decode(bytes.NewReader(elemBytes))
+	if err != nil {
+		t.Fatalf("decode element png: %v", err)
+	}
+	if b := elemImg.Bounds(); b.Dx() != 540 || b.Dy() != 960 {
+		t.Errorf("element screenshot dimensions = %dx%d, want 540x960", b.Dx(), b.Dy())
+	}
+
+	raw, err := os.ReadFile(cfg.ImagePath("2026-06-15"))
+	if err != nil {
+		t.Fatalf("read 4bpp image: %v", err)
+	}
+	if len(raw) != 259200 {
+		t.Errorf("len(raw) = %d, want 259200", len(raw))
 	}
 }

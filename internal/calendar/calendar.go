@@ -81,7 +81,12 @@ type Service struct {
 	srvErr        error
 	tokSrc        oauth2.TokenSource
 	accessTok     string
+	tokenExpiry   time.Time
 	refreshCancel context.CancelFunc
+	refreshDone   chan struct{}
+
+	setupMu     sync.Mutex
+	tokenFileMu sync.Mutex
 
 	stateMu       sync.Mutex
 	pendingStates map[string]time.Time
@@ -117,36 +122,45 @@ func NewService(ctx context.Context, opts Options) (*Service, error) {
 	return s, s.init(ctx)
 }
 
-// Close stops the background OAuth token refresh loop.
+// Close stops the background OAuth token refresh loop and waits for it to exit.
 func (s *Service) Close() {
 	if s == nil {
 		return
 	}
+	s.stopRefreshLoop()
+}
+
+func (s *Service) stopRefreshLoop() {
 	s.mu.Lock()
 	cancel := s.refreshCancel
+	done := s.refreshDone
 	s.refreshCancel = nil
+	s.refreshDone = nil
 	s.mu.Unlock()
 	if cancel != nil {
 		cancel()
 	}
+	if done != nil {
+		<-done
+	}
 }
 
-// TokenExpiry returns the current OAuth access token expiry formatted as RFC3339, or empty if unavailable.
+// TokenExpiry returns the cached OAuth access token expiry formatted as RFC3339, or empty if unavailable.
 func (s *Service) TokenExpiry() string {
 	if s == nil {
 		return ""
 	}
 	s.mu.RLock()
-	tokSrc := s.tokSrc
+	expiry := s.tokenExpiry
 	s.mu.RUnlock()
-	if tokSrc == nil {
+	if expiry.IsZero() {
 		return ""
 	}
-	tok, err := tokSrc.Token()
-	if err != nil {
-		return ""
-	}
-	return tok.Expiry.In(s.loc).Format(time.RFC3339)
+	return expiry.In(s.loc).Format(time.RFC3339)
+}
+
+func oauthHTTPContext(parent context.Context) context.Context {
+	return context.WithValue(parent, oauth2.HTTPClient, &http.Client{Timeout: fetchTimeout})
 }
 
 func (s *Service) init(ctx context.Context) error {
@@ -174,22 +188,22 @@ func (s *Service) init(ctx context.Context) error {
 }
 
 func (s *Service) setupService(ctx context.Context) error {
+	s.setupMu.Lock()
+	defer s.setupMu.Unlock()
+
 	s.mu.RLock()
 	cfg := s.config
 	s.mu.RUnlock()
 
 	if cfg == nil {
 		err := errors.New("oauth2 config is nil")
-		s.mu.Lock()
-		s.fetcher = nil
-		s.tokSrc = nil
-		s.accessTok = ""
-		s.srvErr = err
-		s.mu.Unlock()
+		s.recordSetupError(err)
 		return err
 	}
 
+	s.tokenFileMu.Lock()
 	tok, err := readTokenFile(s.tokenFile)
+	s.tokenFileMu.Unlock()
 	if err != nil {
 		wrapErr := fmt.Errorf("invalid token file, visit /newtoken: %w", err)
 		s.recordSetupError(wrapErr)
@@ -198,9 +212,10 @@ func (s *Service) setupService(ctx context.Context) error {
 
 	initCtx, cancel := context.WithTimeout(ctx, fetchTimeout)
 	defer cancel()
+	initOAuthCtx := oauthHTTPContext(initCtx)
 
-	// Refresh and verify the token outside s.mu with a bounded timeout context.
-	initTokSrc := cfg.TokenSource(initCtx, tok)
+	// Refresh and verify the token outside s.mu with a bounded timeout and HTTP client.
+	initTokSrc := cfg.TokenSource(initOAuthCtx, tok)
 	liveTok, err := initTokSrc.Token()
 	if err != nil {
 		wrapErr := fmt.Errorf("obtain oauth token: %w", err)
@@ -213,48 +228,55 @@ func (s *Service) setupService(ctx context.Context) error {
 		return expErr
 	}
 
+	// Stop any previous refresh loop before writing token.json or installing the new TokenSource.
+	s.stopRefreshLoop()
+
 	if liveTok.AccessToken != tok.AccessToken {
-		if err := saveTokenAtomic(s.tokenFile, liveTok); err != nil {
-			log.Printf("Failed to save renewed token on startup: %v", err)
+		s.tokenFileMu.Lock()
+		saveErr := saveTokenAtomic(s.tokenFile, liveTok)
+		s.tokenFileMu.Unlock()
+		if saveErr != nil {
+			log.Printf("Failed to save renewed token on startup: %v", saveErr)
 		}
 	}
 
-	bgCtx := context.Background()
-	tokSrc := cfg.TokenSource(bgCtx, liveTok)
-	client := oauth2.NewClient(bgCtx, tokSrc)
+	refreshCtx, refreshCancel := context.WithCancel(context.Background())
+	oauthCtx := oauthHTTPContext(refreshCtx)
+	tokSrc := cfg.TokenSource(oauthCtx, liveTok)
+	client := oauth2.NewClient(oauthCtx, tokSrc)
 
 	srv, err := gcal.NewService(initCtx, option.WithHTTPClient(client))
 	if err != nil {
+		refreshCancel()
 		s.recordSetupError(err)
 		return err
 	}
 
-	refreshCtx, refreshCancel := context.WithCancel(bgCtx)
-
+	done := make(chan struct{})
 	s.mu.Lock()
-	if s.refreshCancel != nil {
-		s.refreshCancel()
-	}
 	s.fetcher = &googleEventFetcher{srv: srv}
 	s.tokSrc = tokSrc
 	s.accessTok = liveTok.AccessToken
+	s.tokenExpiry = liveTok.Expiry
 	s.srvErr = nil
 	s.refreshCancel = refreshCancel
+	s.refreshDone = done
 	s.mu.Unlock()
 
-	go s.refreshTokenLoop(refreshCtx, tokSrc)
+	go func() {
+		defer close(done)
+		s.refreshTokenLoop(refreshCtx, tokSrc)
+	}()
 	return nil
 }
 
 func (s *Service) recordSetupError(err error) {
+	s.stopRefreshLoop()
 	s.mu.Lock()
-	if s.refreshCancel != nil {
-		s.refreshCancel()
-		s.refreshCancel = nil
-	}
 	s.fetcher = nil
 	s.tokSrc = nil
 	s.accessTok = ""
+	s.tokenExpiry = time.Time{}
 	s.srvErr = err
 	s.mu.Unlock()
 }
@@ -270,16 +292,45 @@ func (s *Service) refreshTokenLoop(ctx context.Context, tokSrc oauth2.TokenSourc
 		case <-ticker.C:
 			tok, err := tokSrc.Token()
 			if err != nil {
+				if ctx.Err() != nil {
+					return
+				}
 				log.Printf("Refresh token failed: %v", err)
 				continue
 			}
-			s.mu.Lock()
-			if s.accessTok != tok.AccessToken {
-				if err := saveTokenAtomic(s.tokenFile, tok); err != nil {
-					log.Printf("Save refreshed token failed: %v", err)
-					s.mu.Unlock()
+
+			s.mu.RLock()
+			stale := ctx.Err() != nil || s.tokSrc != tokSrc
+			changed := s.accessTok != tok.AccessToken
+			s.mu.RUnlock()
+			if stale {
+				return
+			}
+
+			if changed {
+				s.tokenFileMu.Lock()
+				s.mu.RLock()
+				stillActive := ctx.Err() == nil && s.tokSrc == tokSrc
+				s.mu.RUnlock()
+				if !stillActive {
+					s.tokenFileMu.Unlock()
+					return
+				}
+				saveErr := saveTokenAtomic(s.tokenFile, tok)
+				s.tokenFileMu.Unlock()
+				if saveErr != nil {
+					log.Printf("Save refreshed token failed: %v", saveErr)
 					continue
 				}
+			}
+
+			s.mu.Lock()
+			if ctx.Err() != nil || s.tokSrc != tokSrc {
+				s.mu.Unlock()
+				return
+			}
+			s.tokenExpiry = tok.Expiry
+			if changed {
 				s.accessTok = tok.AccessToken
 				log.Print("Saved refreshed OAuth token")
 			}
@@ -351,11 +402,12 @@ func (s *Service) Events(ctx context.Context, t time.Time) ([]*gcal.Event, error
 		return nil, fmt.Errorf("all calendar requests failed: %w", firstErr)
 	}
 
-	// Deduplicate by event ID while dropping nil entries.
+	// Deduplicate by event ID, drop nil entries, and exclude out-of-range all-day events.
+	targetDate := localDay.Format("2006-01-02")
 	seen := make(map[string]struct{}, len(events))
 	deduped := events[:0]
 	for _, ev := range events {
-		if ev == nil {
+		if ev == nil || !isAllDayEventOnDate(ev, targetDate) {
 			continue
 		}
 		if ev.Id != "" {
@@ -486,15 +538,21 @@ func (s *Service) ProcessAuthCode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tok, err := cfg.Exchange(r.Context(), code)
+	exchCtx, cancel := context.WithTimeout(r.Context(), fetchTimeout)
+	defer cancel()
+	tok, err := cfg.Exchange(oauthHTTPContext(exchCtx), code)
 	if err != nil {
 		log.Printf("OAuth code exchange failed: %v", err)
 		http.Error(w, "Token exchange failed", http.StatusInternalServerError)
 		return
 	}
 
-	if err := saveTokenAtomic(s.tokenFile, tok); err != nil {
-		log.Printf("Save OAuth token failed: %v", err)
+	s.stopRefreshLoop()
+	s.tokenFileMu.Lock()
+	saveErr := saveTokenAtomic(s.tokenFile, tok)
+	s.tokenFileMu.Unlock()
+	if saveErr != nil {
+		log.Printf("Save OAuth token failed: %v", saveErr)
 		http.Error(w, "Failed to save token", http.StatusInternalServerError)
 		return
 	}
@@ -615,6 +673,19 @@ func sortEvents(events []*gcal.Event) {
 		}
 		return a.Id < b.Id
 	})
+}
+
+func isAllDayEventOnDate(event *gcal.Event, targetDate string) bool {
+	if event == nil || event.Start == nil || event.Start.Date == "" {
+		return true
+	}
+	if event.Start.Date > targetDate {
+		return false
+	}
+	if event.End != nil && event.End.Date != "" {
+		return targetDate < event.End.Date
+	}
+	return event.Start.Date == targetDate
 }
 
 func formatEventLi(event *gcal.Event, now time.Time, loc *time.Location) string {

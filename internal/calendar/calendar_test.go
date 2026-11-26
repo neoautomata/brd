@@ -200,3 +200,120 @@ func TestSaveTokenAtomicPermissionsAndRefreshPreservation(t *testing.T) {
 		t.Errorf("loaded token = %+v, want access-2 and refresh-keep", loaded)
 	}
 }
+
+func TestAllDayEventTimezoneBoundaryFiltering(t *testing.T) {
+	zurich, err := time.LoadLocation("Europe/Zurich")
+	if err != nil {
+		t.Fatalf("load Europe/Zurich: %v", err)
+	}
+	target := time.Date(2026, 6, 15, 10, 0, 0, 0, zurich)
+
+	fetcher := stubFetcher{
+		fn: func(_, _, _ string) ([]*gcal.Event, error) {
+			return []*gcal.Event{
+				// Yesterday's UTC all-day event (ends 2026-06-15 00:00Z > 2026-06-14 22:00Z).
+				{Id: "yesterday", Summary: "Yesterday Holiday", Start: &gcal.EventDateTime{Date: "2026-06-14"}, End: &gcal.EventDateTime{Date: "2026-06-15"}},
+				// Tomorrow's UTC all-day event (could leak in negative UTC offsets).
+				{Id: "tomorrow", Summary: "Tomorrow Holiday", Start: &gcal.EventDateTime{Date: "2026-06-16"}, End: &gcal.EventDateTime{Date: "2026-06-17"}},
+				// Multi-day all-day event covering today.
+				{Id: "multiday", Summary: "Conference", Start: &gcal.EventDateTime{Date: "2026-06-14"}, End: &gcal.EventDateTime{Date: "2026-06-16"}},
+				// Single-day all-day event for today with exclusive end.
+				{Id: "today", Summary: "Today Holiday", Start: &gcal.EventDateTime{Date: "2026-06-15"}, End: &gcal.EventDateTime{Date: "2026-06-16"}},
+				// Single-day all-day event with omitted End.
+				{Id: "today-no-end", Summary: "Today No End", Start: &gcal.EventDateTime{Date: "2026-06-15"}},
+			}, nil
+		},
+	}
+
+	svc, err := NewService(context.Background(), Options{
+		Calendars: []string{"primary"},
+		Location:  zurich,
+		Now:       func() time.Time { return target },
+		Fetcher:   fetcher,
+	})
+	if err != nil {
+		t.Fatalf("NewService failed: %v", err)
+	}
+
+	events, err := svc.Events(context.Background(), target)
+	if err != nil {
+		t.Fatalf("Events failed: %v", err)
+	}
+	gotIDs := make(map[string]bool, len(events))
+	for _, ev := range events {
+		gotIDs[ev.Id] = true
+	}
+	if gotIDs["yesterday"] {
+		t.Error("yesterday all-day event leaked onto today")
+	}
+	if gotIDs["tomorrow"] {
+		t.Error("tomorrow all-day event leaked onto today")
+	}
+	for _, want := range []string{"multiday", "today", "today-no-end"} {
+		if !gotIDs[want] {
+			t.Errorf("expected all-day event %q on target date", want)
+		}
+	}
+}
+
+type panicTokenSource struct{}
+
+func (panicTokenSource) Token() (*oauth2.Token, error) {
+	panic("TokenExpiry must not call tokSrc.Token()")
+}
+
+func TestTokenExpiryUsesCachedValueWithoutNetwork(t *testing.T) {
+	zurich, err := time.LoadLocation("Europe/Zurich")
+	if err != nil {
+		t.Fatalf("load Europe/Zurich: %v", err)
+	}
+	exp := time.Date(2026, 6, 15, 11, 30, 0, 0, time.UTC)
+
+	svc, err := NewService(context.Background(), Options{
+		Location: zurich,
+		Fetcher:  stubFetcher{fn: func(_, _, _ string) ([]*gcal.Event, error) { return nil, nil }},
+	})
+	if err != nil {
+		t.Fatalf("NewService failed: %v", err)
+	}
+
+	svc.mu.Lock()
+	svc.tokSrc = panicTokenSource{}
+	svc.tokenExpiry = exp
+	svc.mu.Unlock()
+
+	got := svc.TokenExpiry()
+	want := exp.In(zurich).Format(time.RFC3339)
+	if got != want {
+		t.Errorf("TokenExpiry() = %q, want %q", got, want)
+	}
+}
+
+func TestCloseWaitsForRefreshLoopExit(t *testing.T) {
+	svc, err := NewService(context.Background(), Options{
+		Location: time.UTC,
+		Fetcher:  stubFetcher{fn: func(_, _, _ string) ([]*gcal.Event, error) { return nil, nil }},
+	})
+	if err != nil {
+		t.Fatalf("NewService failed: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	svc.mu.Lock()
+	svc.refreshCancel = cancel
+	svc.refreshDone = done
+	svc.mu.Unlock()
+
+	go func() {
+		defer close(done)
+		svc.refreshTokenLoop(ctx, panicTokenSource{})
+	}()
+
+	svc.Close()
+	select {
+	case <-done:
+	default:
+		t.Error("expected Close() to wait for refreshTokenLoop exit")
+	}
+}
