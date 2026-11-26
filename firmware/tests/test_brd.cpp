@@ -754,8 +754,6 @@ static void test_power_state_and_telemetry() {
   // Wake classification table tests.
   assert(std::strcmp(brd_power::classify_wake_reason(3, (1ULL << 21), false, false), "Ext_BTN") == 0);
   assert(std::strcmp(brd_power::classify_wake_reason(3, (1ULL << 9), false, false), "Ext_RTC") == 0);
-  assert(std::strcmp(brd_power::classify_wake_reason(3, (1ULL << 47), false, false), "Ext_Touch") == 0);
-  assert(std::strcmp(brd_power::classify_wake_reason(3, (1ULL << 10), false, false), "Ext_Touch") == 0);
   assert(std::strcmp(brd_power::classify_wake_reason(3, 0, true, false), "Ext_RTC") == 0);
   assert(std::strcmp(brd_power::classify_wake_reason(3, 0, false, true), "Ext_RTC") == 0);
   assert(std::strcmp(brd_power::classify_wake_reason(4, 0, false, false), "Int_RTC") == 0);

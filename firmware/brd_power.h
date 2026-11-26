@@ -172,9 +172,6 @@ inline const char *classify_wake_reason(int wake_cause, uint64_t ext1_mask, bool
     if ((ext1_mask & (1ULL << 9)) != 0) {
       return "Ext_RTC";
     }
-    if ((ext1_mask & (1ULL << 47)) != 0 || (ext1_mask & (1ULL << 10)) != 0) {
-      return "Ext_Touch";
-    }
     if (rtc_af || rtc_tf) {
       return "Ext_RTC";
     }
