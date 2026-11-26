@@ -9,6 +9,7 @@ packages:
       wake_at_hr: 7
       wake_at_min: 0
       local_timezone: UTC
+      ntp_server: ""
       image_url_raw: http://example.com/img
       image_url_raw_sha: http://example.com/img.sha
       vlogs_host: ""

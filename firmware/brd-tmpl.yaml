@@ -8,11 +8,12 @@ defaults:
   wake_at_min: 0
   min_awake_sec: 30
   usb_refresh_interval_min: 5
-  periodic_refresh_after_sec: 300
+  periodic_refresh_after_sec: 240
   wifi_connect_timeout_sec: 90
   rtc_i2c_addr: 0x51
   wifi_output_power: 12.0
   local_timezone: UTC
+  ntp_server: ""
   image_url_raw: ""
   image_url_raw_sha: ""
   vlogs_host: ""
@@ -95,6 +96,17 @@ esphome:
     - priority: 200.0
       then:
         - script.execute: sample_batt
+    - priority: 150.0
+      then:
+        - lambda: |-
+            if (std::strlen("${ntp_server}") > 0) {
+              if (esp_sntp_enabled()) {
+                esp_sntp_stop();
+              }
+              esp_sntp_setservername(0, "${ntp_server}");
+              esp_sntp_init();
+              ESP_LOGI("time", "Configured primary SNTP server: %s", "${ntp_server}");
+            }
 
 globals:
   - id: boot_wakeup_cause
@@ -601,6 +613,7 @@ script:
           brd_power::release_sleep_lock();
 
   - id: plan_next_wake
+    mode: single
     then:
       - lambda: |-
           id(next_wake_epoch) = 0;
@@ -638,6 +651,7 @@ script:
                    plan.mode, plan.target_epoch, plan.sleep_seconds, plan.arm_alarm ? 1 : 0);
 
   - id: report_run
+    mode: queued
     then:
       - lambda: |-
           auto now_local = id(ntp_time).now();
