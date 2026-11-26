@@ -28,6 +28,7 @@ const (
 	screenshotTimeout  = 10 * time.Second
 	closeGraceTimeout  = 5 * time.Second
 	widgetSettleDelay  = 1 * time.Second
+	staleTempMaxAge    = 1 * time.Hour
 )
 
 // ErrServiceClosed indicates Regenerate was called after Service.Close.
@@ -174,6 +175,7 @@ type Service struct {
 	converter      Converter
 	settleDelay    time.Duration
 	captureTimeout time.Duration
+	nowFn          func() time.Time
 
 	stateMu   sync.Mutex
 	closed    bool
@@ -201,6 +203,7 @@ func NewService(cfg *config.Config, browsers BrowserFactory, converter Converter
 		converter:      converter,
 		settleDelay:    widgetSettleDelay,
 		captureTimeout: captureTimeout,
+		nowFn:          time.Now,
 		svcCtx:         svcCtx,
 		svcCancel:      svcCancel,
 	}
@@ -302,12 +305,15 @@ func (s *Service) Regenerate(ctx context.Context, dateStr string) error {
 		}
 	}
 
-	winPNG, err := session.WindowScreenshot(runCtx)
-	if err != nil {
-		return fmt.Errorf("capture window screenshot: %w", err)
-	}
-	if err := atomicfile.Write(s.cfg.WindowScreenshotPath(dateStr), winPNG, 0600); err != nil {
-		return fmt.Errorf("write window screenshot: %w", err)
+	todayStr := s.nowFn().In(s.cfg.Location).Format("2006-01-02")
+	if dateStr == todayStr {
+		winPNG, err := session.WindowScreenshot(runCtx)
+		if err != nil {
+			return fmt.Errorf("capture window screenshot: %w", err)
+		}
+		if err := atomicfile.Write(s.cfg.WindowScreenshotPath(dateStr), winPNG, 0600); err != nil {
+			return fmt.Errorf("write window screenshot: %w", err)
+		}
 	}
 
 	elemPNG, err := session.ElementScreenshot(runCtx, "screenshot_content")
@@ -355,7 +361,21 @@ func (s *Service) CleanupOldFiles(now time.Time) {
 			if entry.IsDir() {
 				continue
 			}
-			dateStr := strings.Split(strings.Split(entry.Name(), ".")[0], "_")[0]
+			name := entry.Name()
+			if strings.HasPrefix(name, ".tmp-") {
+				info, err := entry.Info()
+				if err != nil || now.Sub(info.ModTime()) < staleTempMaxAge {
+					continue
+				}
+				targetPath := filepath.Join(dir, name)
+				if err := os.Remove(targetPath); err != nil {
+					log.Printf("Delete stale temp file %q failed: %v", targetPath, err)
+				} else {
+					log.Printf("Deleted stale temp file %s", targetPath)
+				}
+				continue
+			}
+			dateStr := strings.Split(strings.Split(name, ".")[0], "_")[0]
 			if len(dateStr) != len("2006-01-02") {
 				continue
 			}

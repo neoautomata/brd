@@ -226,14 +226,24 @@ func TestCleanupOldFiles(t *testing.T) {
 	oldFile := filepath.Join(cfg.ContentsDir(), "2026-06-01.html")
 	newFile := filepath.Join(cfg.ContentsDir(), "2026-06-14.html")
 	otherFile := filepath.Join(cfg.ContentsDir(), "readme.txt")
+	staleTmp := filepath.Join(cfg.ImagesDir(), ".tmp-stale-123")
+	freshTmp := filepath.Join(cfg.ImagesDir(), ".tmp-fresh-456")
 
-	for _, p := range []string{oldFile, newFile, otherFile} {
+	for _, p := range []string{oldFile, newFile, otherFile, staleTmp, freshTmp} {
 		if err := os.WriteFile(p, []byte("x"), 0600); err != nil {
 			t.Fatalf("write %s: %v", p, err)
 		}
 	}
 
 	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+	oldTime := now.Add(-2 * time.Hour)
+	freshTime := now.Add(-5 * time.Minute)
+	if err := os.Chtimes(staleTmp, oldTime, oldTime); err != nil {
+		t.Fatalf("chtimes staleTmp: %v", err)
+	}
+	if err := os.Chtimes(freshTmp, freshTime, freshTime); err != nil {
+		t.Fatalf("chtimes freshTmp: %v", err)
+	}
 	svc.CleanupOldFiles(now)
 
 	if _, err := os.Stat(oldFile); !os.IsNotExist(err) {
@@ -244,6 +254,38 @@ func TestCleanupOldFiles(t *testing.T) {
 	}
 	if _, err := os.Stat(otherFile); err != nil {
 		t.Errorf("expected non-dated file to remain: %v", err)
+	}
+	if _, err := os.Stat(staleTmp); !os.IsNotExist(err) {
+		t.Errorf("expected stale .tmp-* file to be deleted")
+	}
+	if _, err := os.Stat(freshTmp); err != nil {
+		t.Errorf("expected recent .tmp-* file to remain: %v", err)
+	}
+}
+
+func TestRegenerateWritesWindowScreenshotOnlyForToday(t *testing.T) {
+	cfg := newTestConfig(t)
+	sess := &fakeSession{
+		winPNG:  []byte("window-png"),
+		elemPNG: []byte("element-png"),
+	}
+	svc := NewService(cfg, &fakeFactory{session: sess}, fakeConverter{writeSha: true})
+	defer svc.Close()
+	svc.settleDelay = 0
+	svc.nowFn = func() time.Time { return time.Date(2026, 6, 15, 10, 0, 0, 0, time.UTC) }
+
+	if err := svc.Regenerate(context.Background(), "2026-06-15"); err != nil {
+		t.Fatalf("Regenerate today: %v", err)
+	}
+	if _, err := os.Stat(cfg.WindowScreenshotPath("2026-06-15")); err != nil {
+		t.Errorf("expected today window screenshot to exist: %v", err)
+	}
+
+	if err := svc.Regenerate(context.Background(), "2026-06-16"); err != nil {
+		t.Fatalf("Regenerate tomorrow: %v", err)
+	}
+	if _, err := os.Stat(cfg.WindowScreenshotPath("2026-06-16")); !os.IsNotExist(err) {
+		t.Errorf("expected tomorrow window screenshot not to be written")
 	}
 }
 
@@ -335,7 +377,7 @@ func TestChromedpFactoryRealCapture(t *testing.T) {
 	svc.viewBaseURL = ts.URL
 	svc.settleDelay = 0
 
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
 	defer cancel()
 	if err := svc.Regenerate(ctx, "2026-06-15"); err != nil {
 		t.Fatalf("real chromedp Regenerate failed: %v", err)

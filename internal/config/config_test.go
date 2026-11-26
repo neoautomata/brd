@@ -156,6 +156,11 @@ func TestParseValidationErrors(t *testing.T) {
 			json:    `{"data_dir":"/tmp/brd","unknown_key":true}`,
 			wantErr: "decode config JSON",
 		},
+		{
+			name:    "trailing JSON data rejected",
+			json:    `{"data_dir":"/tmp/brd"}{"extra":1}`,
+			wantErr: "trailing data",
+		},
 	}
 
 	for _, tc := range tests {

@@ -113,23 +113,23 @@ func NewServer(deps Dependencies) *Server {
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("/", s.handleView)
-	mux.HandleFunc("/ckengine5.css", s.handleCSS)
+	mux.HandleFunc("GET /{$}", s.handleView)
+	mux.HandleFunc("GET /ckengine5.css", s.handleCSS)
 
-	mux.Handle("/edit", s.authz.RequireEditor(http.HandlerFunc(s.handleEdit)))
-	mux.Handle("/update", s.authz.RequireEditor(http.HandlerFunc(s.handleUpdate)))
+	mux.Handle("GET /edit", s.authz.RequireEditor(http.HandlerFunc(s.handleEdit)))
+	mux.Handle("POST /update", s.authz.RequireEditor(http.HandlerFunc(s.handleUpdate)))
 
-	mux.Handle("/newtoken", s.authz.RequireAdmin(http.HandlerFunc(s.handleNewToken)))
-	mux.Handle("/savetoken", s.authz.RequireAdmin(http.HandlerFunc(s.handleSaveToken)))
+	mux.Handle("GET /newtoken", s.authz.RequireAdmin(http.HandlerFunc(s.handleNewToken)))
+	mux.Handle("GET /savetoken", s.authz.RequireAdmin(http.HandlerFunc(s.handleSaveToken)))
 
-	mux.HandleFunc("/window_screenshot", s.serveDatedFile(0, "image/png", s.cfg.WindowScreenshotPath))
-	mux.HandleFunc("/screenshot", s.serveDatedFile(0, "image/png", s.cfg.ScreenshotPath))
-	mux.HandleFunc("/img", s.serveDatedFile(0, "application/octet-stream", s.cfg.ImagePath))
-	mux.HandleFunc("/img.sha", s.serveDatedFile(0, "text/plain; charset=utf-8", s.cfg.HashPath))
+	mux.HandleFunc("GET /window_screenshot", s.serveDatedFile(0, "image/png", s.cfg.WindowScreenshotPath))
+	mux.HandleFunc("GET /screenshot", s.serveDatedFile(0, "image/png", s.cfg.ScreenshotPath))
+	mux.HandleFunc("GET /img", s.serveDatedFile(0, "application/octet-stream", s.cfg.ImagePath))
+	mux.HandleFunc("GET /img.sha", s.serveDatedFile(0, "text/plain; charset=utf-8", s.cfg.HashPath))
 
-	mux.HandleFunc("/screenshot2", s.serveDatedFile(1, "image/png", s.cfg.ScreenshotPath))
-	mux.HandleFunc("/img2", s.serveDatedFile(1, "application/octet-stream", s.cfg.ImagePath))
-	mux.HandleFunc("/img2.sha", s.serveDatedFile(1, "text/plain; charset=utf-8", s.cfg.HashPath))
+	mux.HandleFunc("GET /screenshot2", s.serveDatedFile(1, "image/png", s.cfg.ScreenshotPath))
+	mux.HandleFunc("GET /img2", s.serveDatedFile(1, "application/octet-stream", s.cfg.ImagePath))
+	mux.HandleFunc("GET /img2.sha", s.serveDatedFile(1, "text/plain; charset=utf-8", s.cfg.HashPath))
 
 	return mux
 }
@@ -337,6 +337,11 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleNewToken(w http.ResponseWriter, r *http.Request) {
 	setDynamicSecurityHeaders(w)
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	if s.cal == nil {
 		http.Error(w, "Calendar service unavailable", http.StatusInternalServerError)
 		return

@@ -305,6 +305,25 @@ func TestUpdateSecurityGuards(t *testing.T) {
 	if tokRR.Code != http.StatusForbidden {
 		t.Errorf("editor /newtoken status = %d, want 403", tokRR.Code)
 	}
+
+	// Non-GET methods rejected on GET-only routes (405)
+	for _, tc := range []struct {
+		method string
+		path   string
+	}{
+		{http.MethodPost, "/img"},
+		{http.MethodPost, "/"},
+		{http.MethodPost, "/edit"},
+		{http.MethodHead, "/newtoken"},
+	} {
+		req := httptest.NewRequest(tc.method, tc.path, nil)
+		req.Header.Set("X-Webauth-User", "admin@example.com")
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, req)
+		if rr.Code != http.StatusMethodNotAllowed {
+			t.Errorf("%s %s status = %d, want 405", tc.method, tc.path, rr.Code)
+		}
+	}
 }
 
 func TestDatePathTraversalAndNoFileCreationOnGet(t *testing.T) {

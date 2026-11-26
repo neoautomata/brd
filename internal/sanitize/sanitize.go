@@ -25,9 +25,11 @@ var voidTags = map[string]bool{
 }
 
 var dropSubtreeTags = map[string]bool{
-	"applet": true, "button": true, "embed": true, "form": true, "iframe": true,
-	"math": true, "noscript": true, "object": true, "script": true, "select": true,
-	"style": true, "svg": true, "template": true, "textarea": true,
+	"applet": true, "audio": true, "button": true, "embed": true, "form": true,
+	"head": true, "iframe": true, "math": true, "noembed": true, "noframes": true,
+	"noscript": true, "object": true, "plaintext": true, "script": true, "select": true,
+	"style": true, "svg": true, "template": true, "textarea": true, "title": true,
+	"video": true, "xmp": true,
 }
 
 var allowedCSSProps = map[string]bool{

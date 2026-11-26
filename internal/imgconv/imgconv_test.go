@@ -67,6 +67,8 @@ func TestToLumaITU601(t *testing.T) {
 		{"pure red", color.RGBA{255, 0, 0, 255}, 76},
 		{"pure green", color.RGBA{0, 255, 0, 255}, 150},
 		{"pure blue", color.RGBA{0, 0, 255, 255}, 29},
+		{"fully transparent composites onto white", color.RGBA{0, 0, 0, 0}, 255},
+		{"50% black over white", color.RGBA{0, 0, 0, 128}, 127},
 	}
 
 	for _, tc := range tests {

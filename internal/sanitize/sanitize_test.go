@@ -68,6 +68,12 @@ func TestHTML(t *testing.T) {
 			wantAbsent:   []string{"<svg", "leaked"},
 		},
 		{
+			name:         "drops title xmp audio video noframes subtrees completely",
+			input:        `<title>secret</title><xmp><raw></xmp><audio>a</audio><video>v</video><noframes>nf</noframes><p>Keep</p>`,
+			wantContains: []string{"<p>Keep</p>"},
+			wantAbsent:   []string{"secret", "raw", "<audio", "<video", "nf"},
+		},
+		{
 			name:         "balances stray closing tags without breaking host layout",
 			input:        `</div></div><p>text</p>`,
 			wantContains: []string{"<p>text</p>"},

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/url"
 	"os"
@@ -98,6 +99,10 @@ func Parse(data []byte, baseDir string) (*Config, error) {
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(cfg); err != nil {
 		return nil, fmt.Errorf("decode config JSON: %w", err)
+	}
+	var trailing any
+	if err := dec.Decode(&trailing); err != io.EOF {
+		return nil, errors.New("decode config JSON: trailing data after JSON object")
 	}
 
 	if err := cfg.validateAndNormalize(baseDir); err != nil {

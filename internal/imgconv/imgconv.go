@@ -216,10 +216,15 @@ func fitToGrayscale(src image.Image, targetW, targetH int) []uint8 {
 	return out
 }
 
-// toLuma applies ITU-R 601-2 luma weights to convert an RGB color to 8-bit grayscale.
+// toLuma composites c over white using its alpha channel and applies ITU-R 601-2 luma weights.
 func toLuma(c color.Color) uint8 {
 	n := color.NRGBAModel.Convert(c).(color.NRGBA)
-	luma := (299*int(n.R) + 587*int(n.G) + 114*int(n.B) + 500) / 1000
+	a := int(n.A)
+	inv := 255 - a
+	r := (int(n.R)*a + 255*inv + 127) / 255
+	g := (int(n.G)*a + 255*inv + 127) / 255
+	b := (int(n.B)*a + 255*inv + 127) / 255
+	luma := (299*r + 587*g + 114*b + 500) / 1000
 	if luma > 255 {
 		return 255
 	}

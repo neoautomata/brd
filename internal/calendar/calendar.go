@@ -189,6 +189,7 @@ func (s *Service) init(ctx context.Context) error {
 		s.recordSetupError(err)
 		return err
 	}
+	warnInsecureFilePerms(s.clientSecretFile)
 	b, err := os.ReadFile(s.clientSecretFile)
 	if err != nil {
 		wrapErr := fmt.Errorf("read client secret file: %w", err)
@@ -228,6 +229,7 @@ func (s *Service) setupService(ctx context.Context) error {
 	}
 
 	s.tokenFileMu.Lock()
+	warnInsecureFilePerms(s.tokenFile)
 	tok, err := readTokenFile(s.tokenFile)
 	s.tokenFileMu.Unlock()
 	if err != nil {
@@ -568,12 +570,8 @@ func (s *Service) ProcessAuthCode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := r.ParseForm(); err != nil {
-		http.Error(w, "Invalid form data", http.StatusBadRequest)
-		return
-	}
-
-	state := r.FormValue("state")
+	q := r.URL.Query()
+	state := q.Get("state")
 	cookie, err := r.Cookie(oauthStateCookieName)
 	if err != nil || subtle.ConstantTimeCompare([]byte(cookie.Value), []byte(state)) != 1 {
 		http.Error(w, "Invalid or expired OAuth state", http.StatusBadRequest)
@@ -594,7 +592,7 @@ func (s *Service) ProcessAuthCode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	code := r.FormValue("code")
+	code := q.Get("code")
 	if code == "" {
 		http.Error(w, "Missing authorization code", http.StatusBadRequest)
 		return
@@ -805,6 +803,17 @@ func formatEventLi(event *gcal.Event, now time.Time, loc *time.Location) string 
 		return ""
 	}
 	return fmt.Sprintf("<li>%s - %s: %s</li>", start.In(loc).Format("15:04"), end.In(loc).Format("15:04"), escapedSummary)
+}
+
+func warnInsecureFilePerms(path string) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return
+	}
+	perm := info.Mode().Perm()
+	if perm&0077 != 0 {
+		log.Printf("Warning: secret file %q has permissive mode %04o; expected 0600", path, perm)
+	}
 }
 
 func readTokenFile(path string) (*oauth2.Token, error) {
