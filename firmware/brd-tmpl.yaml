@@ -121,6 +121,12 @@ globals:
   - id: forced_refresh
     type: bool
     initial_value: 'false'
+  - id: refresh_pending
+    type: bool
+    initial_value: 'false'
+  - id: pending_img_hash
+    type: std::string
+    initial_value: '""'
   - id: wake_touch_x
     type: int
     initial_value: '-1'
@@ -151,6 +157,9 @@ globals:
   - id: rtc_saved_this_run
     type: bool
     initial_value: 'false'
+  - id: rtc_clock_diverged
+    type: bool
+    initial_value: 'false'
 
 wifi:
   fast_connect: true
@@ -176,7 +185,9 @@ button:
     icon: "mdi:update"
     on_press:
       then:
-        - lambda: 'id(forced_refresh) = true;'
+        - lambda: |-
+            id(forced_refresh) = true;
+            id(refresh_pending) = true;
         - script.execute: brd_image_task
 
 binary_sensor:
@@ -271,10 +282,14 @@ time:
                   brd_power::rtc_state.last_rtc_sync_epoch = static_cast<uint32_t>(ntp_now.timestamp);
                   brd_power::rtc_state.update_crc();
                   id(rtc_saved_this_run) = true;
+                  id(rtc_clock_diverged) = false;
                   ESP_LOGI("time", "The firmware saved network time to the hardware RTC.");
                 } else {
+                  id(rtc_clock_diverged) = true;
                   ESP_LOGW("time", "Failed to save network time to the hardware RTC.");
                 }
+              } else {
+                id(rtc_clock_diverged) = true;
               }
             }
 
@@ -312,12 +327,7 @@ interval:
                         - lambda: 'return id(image_download_complete);'
                         - lambda: 'return !id(sleep_watchdog).is_running();'
                 then:
-                  - wait_until:
-                      condition:
-                        lambda: 'return !id(brd_image_task).is_running() && !brd_power::epd_refresh_active && !brd_power::is_sleep_locked();'
-                      timeout: 30s
-                  - script.execute: plan_next_wake
-                  - script.execute: enter_sleep
+                  - script.execute: usb_disconnect_sleep
 
   - interval: ${usb_refresh_interval_min}min
     then:
@@ -332,6 +342,20 @@ interval:
             - script.execute: brd_image_task
 
 script:
+  - id: usb_disconnect_sleep
+    mode: single
+    then:
+      - wait_until:
+          condition:
+            lambda: 'return !id(brd_image_task).is_running() && !brd_power::epd_refresh_active && !brd_power::is_sleep_locked();'
+          timeout: 30s
+      - if:
+          condition:
+            lambda: 'return !brd_power::rtc_state.staying_awake_usb;'
+          then:
+            - script.execute: plan_next_wake
+            - script.execute: enter_sleep
+
   - id: wifi_connect_flow
     mode: single
     then:
@@ -413,156 +437,165 @@ script:
   - id: brd_image_task
     mode: single
     then:
-      - lambda: 'brd_power::acquire_sleep_lock();'
-      - logger.log: "The firmware checks the image version."
       - lambda: |-
-          id(image_is_new) = false;
-          id(image_failed) = false;
-
-          if (std::strlen("${image_url_raw_sha}") == 0 || std::strlen("${image_url_raw}") == 0) {
-            id(image_failed) = true;
-            ESP_LOGE("main", "Image URLs are not configured.");
-            return;
-          }
-
-          auto sha_container = id(http_client).get("${image_url_raw_sha}");
-          if (sha_container == nullptr) {
-            id(image_failed) = true;
-            ESP_LOGE("main", "HTTP GET failed for ${image_url_raw_sha}");
-            return;
-          }
-          if (sha_container->status_code != 200) {
-            id(image_failed) = true;
-            ESP_LOGE("main", "Image version check failed with HTTP status %d", sha_container->status_code);
-            sha_container->end();
-            return;
-          }
-
-          char hash_buf[80];
-          size_t hash_len = 0;
-          {
-            uint32_t last_data = millis();
-            const uint32_t timeout = id(http_client).get_timeout();
-            while (hash_len < sizeof(hash_buf) - 1) {
-              int n = sha_container->read((uint8_t *) hash_buf + hash_len, sizeof(hash_buf) - 1 - hash_len);
-              if (n > 0) {
-                hash_len += static_cast<size_t>(n);
-                last_data = millis();
-                continue;
-              }
-              if (n < 0 || sha_container->is_read_complete() || (millis() - last_data > timeout)) {
-                break;
-              }
-              delay(1);
-              App.feed_wdt();
-            }
-          }
-          sha_container->end();
-
-          char normalized_sha[65];
-          if (!brd_blit::parse_and_normalize_sha256(hash_buf, hash_len, normalized_sha)) {
-            id(image_failed) = true;
-            ESP_LOGE("main", "The server sent an invalid SHA-256 digest.");
-            return;
-          }
-
-          // Compare with saved digest unless user requested a manual refresh.
-          if (!id(forced_refresh) && strcmp(normalized_sha, brd_power::rtc_state.last_img_hash) == 0) {
-            ESP_LOGI("main", "Image %s is unchanged. Skipping display refresh.", normalized_sha);
-            id(image_is_new) = false;
-            id(image_refreshed).publish_state(false);
-            return;
-          }
-
-          auto img_container = id(http_client).get("${image_url_raw}");
-          if (img_container == nullptr) {
-            id(image_failed) = true;
-            ESP_LOGE("main", "HTTP GET failed for ${image_url_raw}");
-            return;
-          }
-          if (img_container->status_code != 200) {
-            id(image_failed) = true;
-            ESP_LOGE("main", "Image download failed with HTTP status %d", img_container->status_code);
-            img_container->end();
-            return;
-          }
-
-          uint8_t *dst = brd_blit::framebuffer(id(t5_display));
-          const size_t expected = brd_blit::framebuffer_size(id(t5_display));
-          if (dst == nullptr || expected != brd_blit::FRAMEBUFFER_SIZE) {
-            id(image_failed) = true;
-            ESP_LOGE("main", "Display framebuffer is invalid (%u bytes)", (unsigned) expected);
-            img_container->end();
-            return;
-          }
-          if (!brd_blit::is_expected_content_length(img_container->content_length, expected)) {
-            id(image_failed) = true;
-            ESP_LOGE("main", "Server returned unexpected image size (%u bytes, expected %u)",
-                     (unsigned) img_container->content_length, (unsigned) expected);
-            img_container->end();
-            return;
-          }
-          brd_blit::StagingBuffer stage(expected);
-          if (!stage.valid()) {
-            id(image_failed) = true;
-            ESP_LOGE("main", "Failed to allocate %u-byte staging buffer.", (unsigned) expected);
-            img_container->end();
-            return;
-          }
-          const auto read_res = http_request::http_read_fully(
-              img_container.get(), stage.data(), expected, 4096, id(http_client).get_timeout());
-          const size_t got = img_container->get_bytes_read();
-
-          bool oversized = false;
-          if (read_res.status == http_request::HttpReadStatus::OK && got == expected &&
-              !img_container->is_read_complete()) {
-            uint8_t extra_byte = 0;
-            const auto eof_res = http_request::http_read_fully(
-                img_container.get(), &extra_byte, 1, 1, id(http_client).get_timeout());
-            if (eof_res.status != http_request::HttpReadStatus::OK ||
-                img_container->get_bytes_read() > expected) {
-              oversized = true;
-            }
-          }
-          img_container->end();
-
-          if (read_res.status != http_request::HttpReadStatus::OK || got != expected) {
-            id(image_failed) = true;
-            ESP_LOGE("main", "Image download ended early: read %u of %u bytes (status %d)",
-                     (unsigned) got, (unsigned) expected, (int) read_res.status);
-            return;
-          }
-          if (oversized) {
-            id(image_failed) = true;
-            ESP_LOGE("main", "Image download exceeded %u bytes.", (unsigned) expected);
-            return;
-          }
-          if (brd_blit::copy_framebuffer(dst, expected, stage.data(), got) !=
-              brd_blit::BlitResult::OK) {
-            id(image_failed) = true;
-            ESP_LOGE("main", "Failed to copy staged image into display buffer.");
-            return;
-          }
-
-          strncpy(brd_power::rtc_state.last_img_hash, normalized_sha, sizeof(brd_power::rtc_state.last_img_hash));
-          brd_power::rtc_state.update_crc();
-          id(image_is_new) = true;
-          id(forced_refresh) = false;
-          id(image_refreshed).publish_state(true);
-          ESP_LOGI("main", "The firmware loaded %u bytes into the display buffer.", (unsigned) got);
-      - if:
+          brd_power::acquire_sleep_lock();
+          id(refresh_pending) = true;
+      - while:
           condition:
-            lambda: 'return id(image_is_new);'
+            lambda: 'return id(refresh_pending);'
           then:
+            - lambda: 'id(refresh_pending) = false;'
+            - logger.log: "The firmware checks the image version."
             - lambda: |-
-                esp_wifi_set_ps(WIFI_PS_MAX_MODEM);
-                brd_power::epd_refresh_active = true;
-            - component.update: t5_display
-            - lambda: |-
-                esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
-                brd_power::epd_refresh_active = false;
-                brd_power::poweroff_epd_rails_idle();
-      - script.execute: report_run
+                id(image_is_new) = false;
+                id(image_failed) = false;
+                id(pending_img_hash).clear();
+                const bool force_this_run = id(forced_refresh);
+                id(forced_refresh) = false;
+
+                if (std::strlen("${image_url_raw_sha}") == 0 || std::strlen("${image_url_raw}") == 0) {
+                  id(image_failed) = true;
+                  ESP_LOGE("main", "Image URLs are not configured.");
+                  return;
+                }
+
+                auto sha_container = id(http_client).get("${image_url_raw_sha}");
+                if (sha_container == nullptr) {
+                  id(image_failed) = true;
+                  ESP_LOGE("main", "HTTP GET failed for ${image_url_raw_sha}");
+                  return;
+                }
+                if (sha_container->status_code != 200) {
+                  id(image_failed) = true;
+                  ESP_LOGE("main", "Image version check failed with HTTP status %d", sha_container->status_code);
+                  sha_container->end();
+                  return;
+                }
+
+                char hash_buf[80];
+                const auto sha_res = http_request::http_read_fully(
+                    sha_container.get(), reinterpret_cast<uint8_t *>(hash_buf),
+                    sizeof(hash_buf) - 1, sizeof(hash_buf) - 1, id(http_client).get_timeout());
+                const size_t hash_len = sha_container->get_bytes_read();
+                const bool sha_complete = sha_container->is_read_complete();
+                sha_container->end();
+
+                if (sha_res.status != http_request::HttpReadStatus::OK || !sha_complete) {
+                  id(image_failed) = true;
+                  ESP_LOGE("main", "Image version read failed (status %d, bytes %u, complete %d)",
+                           (int) sha_res.status, (unsigned) hash_len, sha_complete ? 1 : 0);
+                  return;
+                }
+
+                char normalized_sha[65];
+                if (!brd_blit::parse_and_normalize_sha256(hash_buf, hash_len, normalized_sha)) {
+                  id(image_failed) = true;
+                  ESP_LOGE("main", "The server sent an invalid SHA-256 digest.");
+                  return;
+                }
+
+                // Compare with saved digest unless user requested a manual refresh.
+                if (!force_this_run && strcmp(normalized_sha, brd_power::rtc_state.last_img_hash) == 0) {
+                  ESP_LOGI("main", "Image %s is unchanged. Skipping display refresh.", normalized_sha);
+                  id(image_is_new) = false;
+                  id(image_refreshed).publish_state(false);
+                  return;
+                }
+
+                auto img_container = id(http_client).get("${image_url_raw}");
+                if (img_container == nullptr) {
+                  id(image_failed) = true;
+                  ESP_LOGE("main", "HTTP GET failed for ${image_url_raw}");
+                  return;
+                }
+                if (img_container->status_code != 200) {
+                  id(image_failed) = true;
+                  ESP_LOGE("main", "Image download failed with HTTP status %d", img_container->status_code);
+                  img_container->end();
+                  return;
+                }
+
+                uint8_t *dst = brd_blit::framebuffer(id(t5_display));
+                const size_t expected = brd_blit::framebuffer_size(id(t5_display));
+                if (dst == nullptr || expected != brd_blit::FRAMEBUFFER_SIZE) {
+                  id(image_failed) = true;
+                  ESP_LOGE("main", "Display framebuffer is invalid (%u bytes)", (unsigned) expected);
+                  img_container->end();
+                  return;
+                }
+                if (!brd_blit::is_expected_content_length(img_container->content_length, expected)) {
+                  id(image_failed) = true;
+                  ESP_LOGE("main", "Server returned unexpected image size (%u bytes, expected %u)",
+                           (unsigned) img_container->content_length, (unsigned) expected);
+                  img_container->end();
+                  return;
+                }
+                brd_blit::StagingBuffer stage(expected);
+                if (!stage.valid()) {
+                  id(image_failed) = true;
+                  ESP_LOGE("main", "Failed to allocate %u-byte staging buffer.", (unsigned) expected);
+                  img_container->end();
+                  return;
+                }
+                const auto read_res = http_request::http_read_fully(
+                    img_container.get(), stage.data(), expected, 4096, id(http_client).get_timeout());
+                const size_t got = img_container->get_bytes_read();
+
+                bool oversized = false;
+                if (read_res.status == http_request::HttpReadStatus::OK && got == expected &&
+                    !img_container->is_read_complete()) {
+                  uint8_t extra_byte = 0;
+                  const auto eof_res = http_request::http_read_fully(
+                      img_container.get(), &extra_byte, 1, 1, id(http_client).get_timeout());
+                  if (eof_res.status != http_request::HttpReadStatus::OK ||
+                      img_container->get_bytes_read() > expected) {
+                    oversized = true;
+                  }
+                }
+                img_container->end();
+
+                if (read_res.status != http_request::HttpReadStatus::OK || got != expected) {
+                  id(image_failed) = true;
+                  ESP_LOGE("main", "Image download ended early: read %u of %u bytes (status %d)",
+                           (unsigned) got, (unsigned) expected, (int) read_res.status);
+                  return;
+                }
+                if (oversized) {
+                  id(image_failed) = true;
+                  ESP_LOGE("main", "Image download exceeded %u bytes.", (unsigned) expected);
+                  return;
+                }
+                if (brd_blit::copy_framebuffer(dst, expected, stage.data(), got) !=
+                    brd_blit::BlitResult::OK) {
+                  id(image_failed) = true;
+                  ESP_LOGE("main", "Failed to copy staged image into display buffer.");
+                  return;
+                }
+
+                id(pending_img_hash) = normalized_sha;
+                id(image_is_new) = true;
+                id(image_refreshed).publish_state(true);
+                ESP_LOGI("main", "The firmware loaded %u bytes into the display buffer.", (unsigned) got);
+            - if:
+                condition:
+                  lambda: 'return id(image_is_new);'
+                then:
+                  - lambda: |-
+                      esp_wifi_set_ps(WIFI_PS_MAX_MODEM);
+                      brd_power::epd_refresh_active = true;
+                  - component.update: t5_display
+                  - lambda: |-
+                      esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+                      brd_power::epd_refresh_active = false;
+                      brd_power::poweroff_epd_rails_idle();
+                      if (id(pending_img_hash).size() == brd_blit::SHA256_HEX_LEN) {
+                        strncpy(brd_power::rtc_state.last_img_hash, id(pending_img_hash).c_str(),
+                                sizeof(brd_power::rtc_state.last_img_hash) - 1);
+                        brd_power::rtc_state.last_img_hash[sizeof(brd_power::rtc_state.last_img_hash) - 1] = '\0';
+                        brd_power::rtc_state.update_crc();
+                        id(pending_img_hash).clear();
+                      }
+            - script.execute: report_run
       - lambda: |-
           id(image_download_complete) = true;
           brd_power::release_sleep_lock();
@@ -621,15 +654,16 @@ script:
 
           const char *mode = "none";
           char next_buf[32];
-          char next_in_buf[12];
+          char next_in_buf[24];
           if (id(next_wake_epoch) != 0) {
             mode = id(next_wake_is_overnight) ? "alarm" : "timer";
             ESPTime next_local = ESPTime::from_epoch_local(id(next_wake_epoch));
             next_local.strftime(next_buf, sizeof(next_buf), "%Y-%m-%dT%H:%M:%S%z");
 
             if (now_local.is_valid()) {
-              snprintf(next_in_buf, sizeof(next_in_buf), "%d",
-                       (int) id(next_wake_epoch) - (int) now_local.timestamp);
+              const int64_t next_in = static_cast<int64_t>(id(next_wake_epoch)) -
+                                      static_cast<int64_t>(now_local.timestamp);
+              snprintf(next_in_buf, sizeof(next_in_buf), "%" PRId64, next_in);
             } else {
               snprintf(next_in_buf, sizeof(next_in_buf), "unknown");
             }
@@ -642,7 +676,7 @@ script:
           char since_buf[16];
           long since_num = -1;
           if (now_epoch != 0 && brd_power::rtc_state.prev_trace_epoch != 0 &&
-              now_epoch > brd_power::rtc_state.prev_trace_epoch) {
+              now_epoch >= brd_power::rtc_state.prev_trace_epoch) {
             since_num = static_cast<long>(now_epoch - brd_power::rtc_state.prev_trace_epoch);
             snprintf(since_buf, sizeof(since_buf), "%ld", since_num);
           } else {
@@ -675,7 +709,10 @@ script:
               now_epoch, brd_power::rtc_state.last_rtc_sync_epoch);
 
           char line[384];
-          brd_power::format_vlogs_message(line, sizeof(line), telem);
+          const int line_len = brd_power::format_vlogs_message(line, sizeof(line), telem);
+          if (line_len < 0 || static_cast<size_t>(line_len) >= sizeof(line)) {
+            ESP_LOGW("trace", "Telemetry log line truncated (%d bytes).", line_len);
+          }
           ESP_LOGI("trace", "%s", line);
 
           auto post = [](const char *what, const std::string &url, const std::string &body, const char *content_type) {
@@ -686,7 +723,11 @@ script:
             if (container == nullptr) {
               ESP_LOGW("trace", "%s: request to telemetry host failed", what);
             } else {
-              ESP_LOGD("trace", "%s: telemetry host returned %d", what, container->status_code);
+              if (container->status_code < 200 || container->status_code >= 300) {
+                ESP_LOGW("trace", "%s: telemetry host returned HTTP %d", what, container->status_code);
+              } else {
+                ESP_LOGD("trace", "%s: telemetry host returned %d", what, container->status_code);
+              }
               container->end();
             }
           };
@@ -702,18 +743,24 @@ script:
           }
 
           if (std::strlen("${vmetrics_host}") > 0) {
-            char prom[448];
-            brd_power::format_vmetrics_prometheus(prom, sizeof(prom), telem);
-            post("prometheus",
-                 "${vmetrics_host}/api/v1/import/prometheus",
-                 prom, "text/plain");
+            char prom[640];
+            const int prom_len = brd_power::format_vmetrics_prometheus(prom, sizeof(prom), telem);
+            if (prom_len > 0 && static_cast<size_t>(prom_len) < sizeof(prom)) {
+              post("prometheus",
+                   "${vmetrics_host}/api/v1/import/prometheus",
+                   prom, "text/plain");
+            } else {
+              ESP_LOGW("trace", "Prometheus payload truncated (%d bytes). Skipping upload.", prom_len);
+            }
           }
 
           const uint32_t current_batt_mv = brd_power::voltage_to_mv(id(batt_voltage).state);
           if (current_batt_mv > 0) {
             brd_power::rtc_state.prev_batt_mv = current_batt_mv;
           }
-          brd_power::rtc_state.prev_trace_epoch = now_epoch;
+          if (now_epoch > 0) {
+            brd_power::rtc_state.prev_trace_epoch = now_epoch;
+          }
           brd_power::rtc_state.prev_slept = false;
           brd_power::rtc_state.prev_gt911 = -1;
           brd_power::rtc_state.update_crc();
@@ -850,7 +897,10 @@ script:
 
           brd_rtc::EspHomeI2cAdapter i2c_bus(id(lilygo_t5_47_plus_i2c));
           brd_rtc::WakeSettings ws;
-          ws.use_alarm = final_plan.arm_alarm;
+          ws.use_alarm = final_plan.arm_alarm && !id(rtc_clock_diverged);
+          if (final_plan.arm_alarm && id(rtc_clock_diverged)) {
+            ESP_LOGW("sleep", "Hardware RTC save failed earlier. Using countdown timer instead of alarm.");
+          }
           ws.target_utc_hour = final_plan.target_utc_hour;
           ws.target_utc_minute = final_plan.target_utc_minute;
           ws.sleep_seconds = final_plan.sleep_seconds;

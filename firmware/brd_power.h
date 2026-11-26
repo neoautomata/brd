@@ -273,6 +273,32 @@ struct TraceTelemetry {
   long rtc_sync_age_sec{-1};
 };
 
+inline void escape_prom_label(const char *src, char *dst, size_t dst_len) {
+  if (dst == nullptr || dst_len == 0U) {
+    return;
+  }
+  if (src == nullptr) {
+    dst[0] = '\0';
+    return;
+  }
+  size_t out = 0U;
+  for (size_t i = 0U; src[i] != '\0' && out + 1U < dst_len; ++i) {
+    const char c = src[i];
+    if (c == '\\' || c == '"' || c == '\n') {
+      if (out + 2U >= dst_len) {
+        break;
+      }
+      dst[out++] = '\\';
+      dst[out++] = (c == '\n') ? 'n' : c;
+    } else if (c == '\r') {
+      continue;
+    } else {
+      dst[out++] = c;
+    }
+  }
+  dst[out] = '\0';
+}
+
 inline int format_vlogs_message(char *buf, size_t len, const TraceTelemetry &t) {
   char touch_buf[24];
   if (t.touch_x >= 0 && t.touch_y >= 0) {
@@ -286,6 +312,22 @@ inline int format_vlogs_message(char *buf, size_t len, const TraceTelemetry &t) 
                        : (t.prev_gt911 == 0) ? "nack"
                                              : "none";
 
+  char batt_v_buf[16];
+  if (std::isfinite(t.batt_v)) {
+    snprintf(batt_v_buf, sizeof(batt_v_buf), "%.2fV", t.batt_v);
+  } else {
+    snprintf(batt_v_buf, sizeof(batt_v_buf), "unknown");
+  }
+
+  char batt_pct_buf[16];
+  if (std::isfinite(t.batt_pct)) {
+    snprintf(batt_pct_buf, sizeof(batt_pct_buf), "%.0f%%", t.batt_pct);
+  } else {
+    snprintf(batt_pct_buf, sizeof(batt_pct_buf), "unknown");
+  }
+
+  const float awake_s = std::isfinite(t.awake_s) ? t.awake_s : 0.0f;
+
   char sync_age_buf[24];
   if (t.rtc_sync_age_sec >= 0) {
     snprintf(sync_age_buf, sizeof(sync_age_buf), "%lds", t.rtc_sync_age_sec);
@@ -294,14 +336,14 @@ inline int format_vlogs_message(char *buf, size_t len, const TraceTelemetry &t) 
   }
 
   return snprintf(buf, len,
-                  "wake=%s mode=%s batt=%.2fV batt_pct=%.0f%% awake=%.1fs image=%s touch=%s "
+                  "wake=%s mode=%s batt=%s batt_pct=%s awake=%.1fs image=%s touch=%s "
                   "now=%s next=%s next_in=%ss since=%ss slept=%s prev_gt911=%s boots=%" PRIu32
                   " rtc_sync=%s rtc_sync_age=%s",
                   t.wake_reason != nullptr ? t.wake_reason : "unknown",
                   t.mode != nullptr ? t.mode : "none",
-                  t.batt_v,
-                  t.batt_pct,
-                  t.awake_s,
+                  batt_v_buf,
+                  batt_pct_buf,
+                  awake_s,
                   t.image_status != nullptr ? t.image_status : "cached",
                   touch_buf,
                   t.now_str != nullptr ? t.now_str : "unknown",
@@ -317,11 +359,31 @@ inline int format_vlogs_message(char *buf, size_t len, const TraceTelemetry &t) 
 
 inline int format_vmetrics_prometheus(char *buf, size_t len, const TraceTelemetry &t) {
   const int gt911_slept_val = (t.prev_gt911 == 0) ? 0 : ((t.prev_gt911 > 0) ? 1 : -1);
-  const char *job = t.job_name != nullptr ? t.job_name : "brd";
+  char job[96];
+  escape_prom_label(t.job_name != nullptr ? t.job_name : "brd", job, sizeof(job));
+
+  const float awake_s = std::isfinite(t.awake_s) ? t.awake_s : 0.0f;
+
+  char batt_lines[256];
+  int batt_len = 0;
+  batt_lines[0] = '\0';
+  if (std::isfinite(t.batt_v)) {
+    const int n = snprintf(batt_lines + batt_len, sizeof(batt_lines) - static_cast<size_t>(batt_len),
+                           "battery_voltage{job=\"%s\"} %.2f\n", job, t.batt_v);
+    if (n > 0 && static_cast<size_t>(batt_len + n) < sizeof(batt_lines)) {
+      batt_len += n;
+    }
+  }
+  if (std::isfinite(t.batt_pct)) {
+    const int n = snprintf(batt_lines + batt_len, sizeof(batt_lines) - static_cast<size_t>(batt_len),
+                           "battery_percent{job=\"%s\"} %.0f\n", job, t.batt_pct);
+    if (n > 0 && static_cast<size_t>(batt_len + n) < sizeof(batt_lines)) {
+      batt_len += n;
+    }
+  }
 
   return snprintf(buf, len,
-                  "battery_voltage{job=\"%s\"} %.2f\n"
-                  "battery_percent{job=\"%s\"} %.0f\n"
+                  "%s"
                   "wake_secs{job=\"%s\"} %.1f\n"
                   "run_gap_secs{job=\"%s\"} %ld\n"
                   "prev_slept{job=\"%s\"} %d\n"
@@ -329,9 +391,8 @@ inline int format_vmetrics_prometheus(char *buf, size_t len, const TraceTelemetr
                   "boot_count{job=\"%s\"} %" PRIu32 "\n"
                   "rtc_synced{job=\"%s\"} %d\n"
                   "rtc_sync_age_secs{job=\"%s\"} %ld",
-                  job, t.batt_v,
-                  job, t.batt_pct,
-                  job, t.awake_s,
+                  batt_lines,
+                  job, awake_s,
                   job, t.since_num,
                   job, t.prev_slept ? 1 : 0,
                   job, gt911_slept_val,

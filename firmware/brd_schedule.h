@@ -195,6 +195,7 @@ struct ScheduleConfig {
   int lead_margin_sec{120};
   int boundary_interval_min{15};
   int min_alarm_lead_sec{90};
+  int max_alarm_lead_sec{86100};
   int bedtime_advance_threshold_sec{60};
   uint32_t fallback_sleep_sec{900};
 };
@@ -250,8 +251,10 @@ inline SchedulePlan plan_next_wake(const CalendarPort &cal, int64_t now_epoch,
     const int next_min = ((now_local.minute / interval_min) + 1) * interval_min;
     WallTime cand = now_local;
     cand.second = 0;
-    cand.minute = next_min % 60;
-    cand.hour = now_local.hour + (next_min / 60);
+    cand.minute = next_min;
+    if (!normalize_civil_datetime(cand)) {
+      return plan;
+    }
 
     int64_t cand_epoch = 0;
     if (!cal.local_to_epoch(cand, cand_epoch)) {
@@ -260,11 +263,7 @@ inline SchedulePlan plan_next_wake(const CalendarPort &cal, int64_t now_epoch,
 
     if (cand_epoch - now_epoch < cfg.lead_margin_sec) {
       cand.minute += interval_min;
-      if (cand.minute >= 60) {
-        cand.minute -= 60;
-        cand.hour += 1;
-      }
-      if (!cal.local_to_epoch(cand, cand_epoch)) {
+      if (!normalize_civil_datetime(cand) || !cal.local_to_epoch(cand, cand_epoch)) {
         return plan;
       }
     }
@@ -325,7 +324,7 @@ inline SchedulePlan plan_next_wake(const CalendarPort &cal, int64_t now_epoch,
   plan.clock_valid = true;
   plan.arm_alarm = false;
 
-  if (diff >= cfg.min_alarm_lead_sec && diff < 86400) {
+  if (diff >= cfg.min_alarm_lead_sec && diff < cfg.max_alarm_lead_sec) {
     WallTime target_utc {};
     if (cal.epoch_to_utc(target_epoch, target_utc)) {
       plan.arm_alarm = true;
@@ -364,7 +363,7 @@ inline SchedulePlan revalidate_before_sleep(const CalendarPort &cal, int64_t now
   updated.clock_valid = true;
   updated.arm_alarm = false;
 
-  if (remaining >= cfg.min_alarm_lead_sec && remaining < 86400) {
+  if (remaining >= cfg.min_alarm_lead_sec && remaining < cfg.max_alarm_lead_sec) {
     WallTime target_utc {};
     if (cal.epoch_to_utc(updated.target_epoch, target_utc)) {
       updated.arm_alarm = true;

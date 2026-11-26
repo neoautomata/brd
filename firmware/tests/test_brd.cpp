@@ -443,6 +443,31 @@ static void test_schedule_dst_and_boundaries() {
   assert(cal.local_to_epoch({2026, 7, 15, 21, 45, 0}, cest_night));
   const auto plan_cest_night = brd_schedule::plan_next_wake(cal, cest_night, cfg);
   assert(plan_cest_night.arm_alarm);
+
+  // Verify 24h alarm wrap safety margin (diff >= max_alarm_lead_sec disables absolute alarm).
+  brd_schedule::ScheduleConfig tight_window_cfg = default_cfg;
+  tight_window_cfg.wake_hour = 7;
+  tight_window_cfg.wake_minute = 0;
+  tight_window_cfg.sleep_hour = 7;
+  tight_window_cfg.sleep_minute = 2;
+  int64_t near_wrap = 0;
+  assert(cal_utc.local_to_epoch({2026, 7, 15, 7, 2, 0}, near_wrap));
+  const auto plan_near_wrap = brd_schedule::plan_next_wake(cal_utc, near_wrap, tight_window_cfg);
+  assert(plan_near_wrap.clock_valid);
+  assert(plan_near_wrap.sleep_seconds == 86280U);
+  assert(!plan_near_wrap.arm_alarm);
+  const auto reval_near_wrap =
+      brd_schedule::revalidate_before_sleep(cal_utc, near_wrap, plan_near_wrap, tight_window_cfg);
+  assert(!reval_near_wrap.arm_alarm);
+
+  // Verify interval > 60 minutes normalizes cleanly across hours.
+  brd_schedule::ScheduleConfig wide_cfg = default_cfg;
+  wide_cfg.boundary_interval_min = 90;
+  int64_t utc_wide = 0;
+  assert(cal_utc.local_to_epoch({2026, 7, 15, 10, 59, 0}, utc_wide));
+  const auto plan_wide = brd_schedule::plan_next_wake(cal_utc, utc_wide, wide_cfg);
+  assert(plan_wide.clock_valid && plan_wide.arm_alarm);
+  assert(plan_wide.target_utc_hour == 11 && plan_wide.target_utc_minute == 30);
   assert(plan_cest_night.target_utc_hour == 4 && plan_cest_night.target_utc_minute == 20);
 
   printf("  -> Passed DST and schedule boundary checks.\n");
@@ -855,10 +880,31 @@ static void test_power_state_and_telemetry() {
   vlen = brd_power::format_vlogs_message(vlogs_msg, sizeof(vlogs_msg), telem);
   assert(vlen > 0 && static_cast<size_t>(vlen) < sizeof(vlogs_msg));
   assert(std::strstr(vlogs_msg, "rtc_sync=timeout rtc_sync_age=unknown") != nullptr);
-  plen = brd_power::format_vmetrics_prometheus(vmetrics_prom, sizeof(vmetrics_prom), telem);
-  assert(plen > 0 && static_cast<size_t>(plen) < sizeof(vmetrics_prom));
-  assert(std::strstr(vmetrics_prom, "rtc_synced{job=\"brd\"} -1") != nullptr);
-  assert(std::strstr(vmetrics_prom, "rtc_sync_age_secs{job=\"brd\"} -1") != nullptr);
+  char vmetrics_prom_large[640];
+  plen = brd_power::format_vmetrics_prometheus(vmetrics_prom_large, sizeof(vmetrics_prom_large), telem);
+  assert(plen > 0 && static_cast<size_t>(plen) < sizeof(vmetrics_prom_large));
+  assert(std::strstr(vmetrics_prom_large, "rtc_synced{job=\"brd\"} -1") != nullptr);
+  assert(std::strstr(vmetrics_prom_large, "rtc_sync_age_secs{job=\"brd\"} -1") != nullptr);
+
+  // Prometheus label escaping and NaN battery handling.
+  char escaped_label[32];
+  brd_power::escape_prom_label("brd\"a\\b\nc\r", escaped_label, sizeof(escaped_label));
+  assert(std::strcmp(escaped_label, "brd\\\"a\\\\b\\nc") == 0);
+
+  brd_power::TraceTelemetry nan_telem = telem;
+  nan_telem.job_name = "kitchen-epaper-display-west-01\"x";
+  nan_telem.batt_v = std::numeric_limits<float>::quiet_NaN();
+  nan_telem.batt_pct = std::numeric_limits<float>::quiet_NaN();
+  nan_telem.awake_s = std::numeric_limits<float>::quiet_NaN();
+  vlen = brd_power::format_vlogs_message(vlogs_msg, sizeof(vlogs_msg), nan_telem);
+  assert(vlen > 0 && static_cast<size_t>(vlen) < sizeof(vlogs_msg));
+  assert(std::strstr(vlogs_msg, "batt=unknown batt_pct=unknown awake=0.0s") != nullptr);
+  plen = brd_power::format_vmetrics_prometheus(vmetrics_prom_large, sizeof(vmetrics_prom_large), nan_telem);
+  assert(plen > 0 && static_cast<size_t>(plen) < sizeof(vmetrics_prom_large));
+  assert(std::strstr(vmetrics_prom_large, "battery_voltage") == nullptr);
+  assert(std::strstr(vmetrics_prom_large, "battery_percent") == nullptr);
+  assert(std::strstr(vmetrics_prom_large, "nan") == nullptr);
+  assert(std::strstr(vmetrics_prom_large, "wake_secs{job=\"kitchen-epaper-display-west-01\\\"x\"} 0.0") != nullptr);
 
   printf("  -> Passed power state and telemetry checks.\n");
 }
