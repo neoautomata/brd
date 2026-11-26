@@ -95,6 +95,24 @@ static void test_blit_bounds_and_errors() {
   assert(brd_blit::copy_framebuffer(dst.data(), dst.size() - 1, src.data(), src.size()) ==
          brd_blit::BlitResult::ERROR_TARGET_OVERFLOW);
 
+  // Content-Length pre-check allows unknown (0 or SIZE_MAX) and exact match, rejects mismatches.
+  assert(brd_blit::is_expected_content_length(0U, brd_blit::FRAMEBUFFER_SIZE));
+  assert(brd_blit::is_expected_content_length(static_cast<size_t>(-1), brd_blit::FRAMEBUFFER_SIZE));
+  assert(brd_blit::is_expected_content_length(brd_blit::FRAMEBUFFER_SIZE, brd_blit::FRAMEBUFFER_SIZE));
+  assert(!brd_blit::is_expected_content_length(1U, brd_blit::FRAMEBUFFER_SIZE));
+  assert(!brd_blit::is_expected_content_length(brd_blit::FRAMEBUFFER_SIZE - 1, brd_blit::FRAMEBUFFER_SIZE));
+  assert(!brd_blit::is_expected_content_length(brd_blit::FRAMEBUFFER_SIZE + 1, brd_blit::FRAMEBUFFER_SIZE));
+
+  // StagingBuffer RAII allocation and copy into framebuffer.
+  brd_blit::StagingBuffer empty_stage(0U);
+  assert(!empty_stage.valid() && empty_stage.data() == nullptr && empty_stage.size() == 0U);
+  brd_blit::StagingBuffer stage(brd_blit::FRAMEBUFFER_SIZE);
+  assert(stage.valid() && stage.data() != nullptr && stage.size() == brd_blit::FRAMEBUFFER_SIZE);
+  std::memset(stage.data(), 0x5A, stage.size());
+  assert(brd_blit::copy_framebuffer(dst.data(), dst.size(), stage.data(), stage.size()) ==
+         brd_blit::BlitResult::OK);
+  assert(dst[0] == 0x5A && dst[brd_blit::FRAMEBUFFER_SIZE - 1] == 0x5A);
+
   printf("  -> Passed blit bounds checks.\n");
 }
 
@@ -668,15 +686,45 @@ static void test_power_state_and_telemetry() {
   state.boot_count = 42;
   state.prev_batt_mv = 4120;
   state.staying_awake_usb = true;
+  state.prev_gt911 = 2;
+  state.last_gt911_addr = 2;
   state.update_crc();
   assert(state.validate_or_reset());
   assert(state.boot_count == 42);
+  assert(state.last_gt911_addr == 2);
+
+  // Clearing telemetry prev_gt911 preserves cached last_gt911_addr.
+  state.prev_gt911 = -1;
+  state.update_crc();
+  assert(state.validate_or_reset());
+  assert(state.prev_gt911 == -1);
+  assert(state.last_gt911_addr == 2);
 
   // Corrupt state single-bit triggers auto-reset.
   state.boot_count ^= 0x01;
   assert(!state.validate_or_reset());
   assert(state.boot_count == 0);
+  assert(state.last_gt911_addr == 0);
   assert(state.validate_or_reset());
+
+  // Sleep lock reference counting and sleep eligibility predicate.
+  brd_power::sleep_lock_count = 0;
+  assert(!brd_power::is_sleep_locked());
+  brd_power::release_sleep_lock();  // Underflow stays clamped at 0.
+  assert(!brd_power::is_sleep_locked());
+  brd_power::acquire_sleep_lock();
+  brd_power::acquire_sleep_lock();
+  assert(brd_power::is_sleep_locked() && brd_power::sleep_lock_count == 2U);
+  brd_power::release_sleep_lock();
+  assert(brd_power::is_sleep_locked() && brd_power::sleep_lock_count == 1U);
+  brd_power::release_sleep_lock();
+  assert(!brd_power::is_sleep_locked() && brd_power::sleep_lock_count == 0U);
+
+  assert(brd_power::can_enter_sleep(false, false, false, 0U));
+  assert(!brd_power::can_enter_sleep(true, false, false, 0U));
+  assert(!brd_power::can_enter_sleep(false, true, false, 0U));
+  assert(!brd_power::can_enter_sleep(false, false, true, 0U));
+  assert(!brd_power::can_enter_sleep(false, false, false, 1U));
 
   // Wake classification table tests.
   assert(std::strcmp(brd_power::classify_wake_reason(3, (1ULL << 21), false, false), "Ext_BTN") == 0);

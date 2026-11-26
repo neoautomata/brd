@@ -3,9 +3,14 @@
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <vector>
+
+#if defined(USE_ESP32) && __has_include(<esp_heap_caps.h>)
+#include <esp_heap_caps.h>
+#endif
 
 #if __has_include("esphome/components/lilygo_t5_47_plus/display.h")
 #include "esphome/components/lilygo_t5_47_plus/display.h"
@@ -24,6 +29,48 @@ enum class BlitResult {
   ERROR_NULL_POINTER = 1,
   ERROR_SIZE_MISMATCH = 2,
   ERROR_TARGET_OVERFLOW = 3,
+};
+
+// Return true when Content-Length is unknown (0 or SIZE_MAX) or matches expected size.
+constexpr bool is_expected_content_length(size_t content_length, size_t expected) {
+  return content_length == 0U || content_length == static_cast<size_t>(-1) ||
+         content_length == expected;
+}
+
+// Non-throwing RAII staging buffer backed by PSRAM on ESP32 when available.
+class StagingBuffer {
+ public:
+  explicit StagingBuffer(size_t size) : size_(size) {
+    if (size == 0U) {
+      return;
+    }
+#if defined(USE_ESP32) && __has_include(<esp_heap_caps.h>)
+    this->data_ = static_cast<uint8_t *>(heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (this->data_ == nullptr) {
+      this->data_ = static_cast<uint8_t *>(std::malloc(size));
+    }
+#else
+    this->data_ = static_cast<uint8_t *>(std::malloc(size));
+#endif
+  }
+
+  ~StagingBuffer() {
+    if (this->data_ != nullptr) {
+      std::free(this->data_);
+    }
+  }
+
+  StagingBuffer(const StagingBuffer &) = delete;
+  StagingBuffer &operator=(const StagingBuffer &) = delete;
+
+  uint8_t *data() { return this->data_; }
+  const uint8_t *data() const { return this->data_; }
+  size_t size() const { return this->size_; }
+  bool valid() const { return this->data_ != nullptr; }
+
+ private:
+  uint8_t *data_{nullptr};
+  size_t size_{0};
 };
 
 // Copy raw packed 4bpp framebuffer data with bounds verification.

@@ -82,6 +82,7 @@ struct RtcPersistentState {
   uint32_t prev_trace_epoch{0};
   bool prev_slept{false};
   int8_t prev_gt911{-1};
+  int8_t last_gt911_addr{0};
   uint32_t last_rtc_sync_epoch{0};
   uint32_t prev_batt_mv{0};
   bool staying_awake_usb{false};
@@ -119,6 +120,7 @@ struct RtcPersistentState {
     this->prev_trace_epoch = 0;
     this->prev_slept = false;
     this->prev_gt911 = -1;
+    this->last_gt911_addr = 0;
     this->last_rtc_sync_epoch = 0;
     this->prev_batt_mv = 0;
     this->staying_awake_usb = false;
@@ -130,6 +132,28 @@ struct RtcPersistentState {
 };
 
 inline RTC_DATA_ATTR RtcPersistentState rtc_state;
+
+inline uint32_t sleep_lock_count{0};
+
+inline void acquire_sleep_lock() {
+  ++sleep_lock_count;
+}
+
+inline void release_sleep_lock() {
+  if (sleep_lock_count > 0U) {
+    --sleep_lock_count;
+  }
+}
+
+inline bool is_sleep_locked() {
+  return sleep_lock_count > 0U;
+}
+
+inline bool can_enter_sleep(bool staying_awake_usb, bool image_task_running,
+                            bool epd_refresh_active, uint32_t active_sleep_locks) {
+  return !staying_awake_usb && !image_task_running && !epd_refresh_active &&
+         active_sleep_locks == 0U;
+}
 
 inline uint32_t voltage_to_mv(float v) {
   if (std::isnan(v) || v <= 0.0f || v > 10.0f) {

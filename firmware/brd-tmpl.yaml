@@ -157,61 +157,7 @@ wifi:
   power_save_mode: light
   output_power: ${wifi_output_power}
   on_connect:
-    - lambda: |-
-        id(image_download_complete) = false;
-        id(image_failed) = false;
-    - script.execute: sample_batt
-    - lambda: |-
-        const uint32_t current_mv = brd_power::voltage_to_mv(id(batt_voltage).state);
-        const bool sof_inc = brd_power::check_usb_sof_incremented();
-        brd_power::rtc_state.staying_awake_usb = brd_power::evaluate_usb_power(
-            current_mv, brd_power::rtc_state.prev_batt_mv, brd_power::rtc_state.staying_awake_usb,
-            sof_inc, id(boot_prev_slept));
-        brd_power::rtc_state.update_crc();
-        if (brd_power::rtc_state.staying_awake_usb) {
-          ESP_LOGI("power", "USB power is active. Keeping device awake.");
-        }
-    - lambda: |-
-        // Sync network time when the hardware RTC clock is invalid or stale.
-        if (!id(ntp_synced_this_run) && !id(rtc_time).now().is_valid()) {
-          id(rtc_time).read_time();
-        }
-        auto rtc_now = id(rtc_time).now();
-        const uint32_t current_epoch = rtc_now.is_valid() ? static_cast<uint32_t>(rtc_now.timestamp) : 0U;
-        if (id(ntp_synced_this_run)) {
-          ESP_LOGI("time", "SNTP already synchronized during this wake.");
-        } else if (brd_power::is_rtc_sync_due(rtc_now.is_valid(), current_epoch,
-                                              brd_power::rtc_state.last_rtc_sync_epoch)) {
-          id(ntp_sync_requested) = true;
-          ESP_LOGI("time", "The firmware requests an SNTP time update.");
-          if (esp_sntp_enabled()) {
-            esp_sntp_restart();
-          } else {
-            esp_sntp_init();
-          }
-        } else {
-          ESP_LOGI("time", "The hardware RTC is current. Skipping SNTP update.");
-        }
-    - if:
-        condition:
-          lambda: 'return id(ntp_sync_requested) && !id(ntp_synced_this_run);'
-        then:
-          - wait_until:
-              condition:
-                lambda: 'return id(ntp_synced_this_run);'
-              timeout: 5s
-          - lambda: |-
-              if (!id(ntp_synced_this_run)) {
-                ESP_LOGW("time", "SNTP time update timed out.");
-              }
-    - script.execute: plan_next_wake
-    - script.execute: brd_image_task
-    - wait_until:
-        condition:
-          lambda: 'return id(image_download_complete);'
-        timeout: 30s
-    - logger.log: "The firmware completed image processing."
-    - script.execute: enter_sleep
+    - script.execute: wifi_connect_flow
 
 logger:
   hardware_uart: USB_SERIAL_JTAG
@@ -368,7 +314,7 @@ interval:
                 then:
                   - wait_until:
                       condition:
-                        lambda: 'return !id(brd_image_task).is_running() && !brd_power::epd_refresh_active;'
+                        lambda: 'return !id(brd_image_task).is_running() && !brd_power::epd_refresh_active && !brd_power::is_sleep_locked();'
                       timeout: 30s
                   - script.execute: plan_next_wake
                   - script.execute: enter_sleep
@@ -386,6 +332,71 @@ interval:
             - script.execute: brd_image_task
 
 script:
+  - id: wifi_connect_flow
+    mode: single
+    then:
+      - if:
+          condition:
+            lambda: 'return id(enter_sleep).is_running();'
+          then:
+            - logger.log: "Sleep sequence is active. Ignoring WiFi reconnect."
+            - script.stop: wifi_connect_flow
+      - lambda: |-
+          id(image_download_complete) = false;
+          id(image_failed) = false;
+      - script.execute: sample_batt
+      - lambda: |-
+          const uint32_t current_mv = brd_power::voltage_to_mv(id(batt_voltage).state);
+          const bool sof_inc = brd_power::check_usb_sof_incremented();
+          brd_power::rtc_state.staying_awake_usb = brd_power::evaluate_usb_power(
+              current_mv, brd_power::rtc_state.prev_batt_mv, brd_power::rtc_state.staying_awake_usb,
+              sof_inc, id(boot_prev_slept));
+          brd_power::rtc_state.update_crc();
+          if (brd_power::rtc_state.staying_awake_usb) {
+            ESP_LOGI("power", "USB power is active. Keeping device awake.");
+          }
+      - lambda: |-
+          // Sync network time when the hardware RTC clock is invalid or stale.
+          if (!id(ntp_synced_this_run) && !id(rtc_time).now().is_valid()) {
+            id(rtc_time).read_time();
+          }
+          auto rtc_now = id(rtc_time).now();
+          const uint32_t current_epoch = rtc_now.is_valid() ? static_cast<uint32_t>(rtc_now.timestamp) : 0U;
+          if (id(ntp_synced_this_run)) {
+            ESP_LOGI("time", "SNTP already synchronized during this wake.");
+          } else if (brd_power::is_rtc_sync_due(rtc_now.is_valid(), current_epoch,
+                                                brd_power::rtc_state.last_rtc_sync_epoch)) {
+            id(ntp_sync_requested) = true;
+            ESP_LOGI("time", "The firmware requests an SNTP time update.");
+            if (esp_sntp_enabled()) {
+              esp_sntp_restart();
+            } else {
+              esp_sntp_init();
+            }
+          } else {
+            ESP_LOGI("time", "The hardware RTC is current. Skipping SNTP update.");
+          }
+      - if:
+          condition:
+            lambda: 'return id(ntp_sync_requested) && !id(ntp_synced_this_run);'
+          then:
+            - wait_until:
+                condition:
+                  lambda: 'return id(ntp_synced_this_run);'
+                timeout: 5s
+            - lambda: |-
+                if (!id(ntp_synced_this_run)) {
+                  ESP_LOGW("time", "SNTP time update timed out.");
+                }
+      - script.execute: plan_next_wake
+      - script.execute: brd_image_task
+      - wait_until:
+          condition:
+            lambda: 'return id(image_download_complete);'
+          timeout: 30s
+      - logger.log: "The firmware completed image processing."
+      - script.execute: enter_sleep
+
   - id: sample_batt
     mode: single
     then:
@@ -402,6 +413,7 @@ script:
   - id: brd_image_task
     mode: single
     then:
+      - lambda: 'brd_power::acquire_sleep_lock();'
       - logger.log: "The firmware checks the image version."
       - lambda: |-
           id(image_is_new) = false;
@@ -483,15 +495,52 @@ script:
             img_container->end();
             return;
           }
+          if (!brd_blit::is_expected_content_length(img_container->content_length, expected)) {
+            id(image_failed) = true;
+            ESP_LOGE("main", "Server returned unexpected image size (%u bytes, expected %u)",
+                     (unsigned) img_container->content_length, (unsigned) expected);
+            img_container->end();
+            return;
+          }
+          brd_blit::StagingBuffer stage(expected);
+          if (!stage.valid()) {
+            id(image_failed) = true;
+            ESP_LOGE("main", "Failed to allocate %u-byte staging buffer.", (unsigned) expected);
+            img_container->end();
+            return;
+          }
           const auto read_res = http_request::http_read_fully(
-              img_container.get(), dst, expected, 4096, id(http_client).get_timeout());
+              img_container.get(), stage.data(), expected, 4096, id(http_client).get_timeout());
           const size_t got = img_container->get_bytes_read();
+
+          bool oversized = false;
+          if (read_res.status == http_request::HttpReadStatus::OK && got == expected &&
+              !img_container->is_read_complete()) {
+            uint8_t extra_byte = 0;
+            const auto eof_res = http_request::http_read_fully(
+                img_container.get(), &extra_byte, 1, 1, id(http_client).get_timeout());
+            if (eof_res.status != http_request::HttpReadStatus::OK ||
+                img_container->get_bytes_read() > expected) {
+              oversized = true;
+            }
+          }
           img_container->end();
 
           if (read_res.status != http_request::HttpReadStatus::OK || got != expected) {
             id(image_failed) = true;
             ESP_LOGE("main", "Image download ended early: read %u of %u bytes (status %d)",
                      (unsigned) got, (unsigned) expected, (int) read_res.status);
+            return;
+          }
+          if (oversized) {
+            id(image_failed) = true;
+            ESP_LOGE("main", "Image download exceeded %u bytes.", (unsigned) expected);
+            return;
+          }
+          if (brd_blit::copy_framebuffer(dst, expected, stage.data(), got) !=
+              brd_blit::BlitResult::OK) {
+            id(image_failed) = true;
+            ESP_LOGE("main", "Failed to copy staged image into display buffer.");
             return;
           }
 
@@ -514,7 +563,9 @@ script:
                 brd_power::epd_refresh_active = false;
                 brd_power::poweroff_epd_rails_idle();
       - script.execute: report_run
-      - lambda: 'id(image_download_complete) = true;'
+      - lambda: |-
+          id(image_download_complete) = true;
+          brd_power::release_sleep_lock();
 
   - id: plan_next_wake
     then:
@@ -669,6 +720,8 @@ script:
           id(ntp_sync_requested) = false;
           id(ntp_synced_this_run) = false;
           id(rtc_saved_this_run) = false;
+          id(wake_touch_x) = -1;
+          id(wake_touch_y) = -1;
 
   - id: sleep_watchdog
     mode: single
@@ -678,7 +731,7 @@ script:
           condition:
             and:
               - lambda: 'return !id(image_download_complete);'
-              - lambda: 'return !id(brd_image_task).is_running() && !brd_power::epd_refresh_active;'
+              - lambda: 'return !id(brd_image_task).is_running() && !brd_power::epd_refresh_active && !brd_power::is_sleep_locked();'
               - not:
                   wifi.connected:
           then:
@@ -700,6 +753,7 @@ script:
                   - logger.log: "WiFi connection timed out on USB power. Staying awake."
 
   - id: enter_sleep
+    mode: single
     then:
       - if:
           condition:
@@ -723,6 +777,49 @@ script:
                   return remaining_ms;
                 }
                 return 0;
+            - wait_until:
+                condition:
+                  lambda: 'return !brd_power::epd_refresh_active;'
+                timeout: 30s
+            - script.execute: sample_batt
+            - lambda: |-
+                const uint32_t current_mv = brd_power::voltage_to_mv(id(batt_voltage).state);
+                const bool sof_inc = brd_power::check_usb_sof_incremented();
+                brd_power::rtc_state.staying_awake_usb = brd_power::evaluate_usb_power(
+                    current_mv, brd_power::rtc_state.prev_batt_mv, brd_power::rtc_state.staying_awake_usb,
+                    sof_inc, id(boot_prev_slept));
+                brd_power::rtc_state.update_crc();
+
+      - wait_until:
+          condition:
+            lambda: |-
+              return brd_power::can_enter_sleep(false, id(brd_image_task).is_running(),
+                                                brd_power::epd_refresh_active,
+                                                brd_power::sleep_lock_count);
+          timeout: 30s
+
+      - if:
+          condition:
+            lambda: |-
+              return !brd_power::can_enter_sleep(false, id(brd_image_task).is_running(),
+                                                 brd_power::epd_refresh_active,
+                                                 brd_power::sleep_lock_count);
+          then:
+            - logger.log: "Critical work is still active. Deferring deep sleep."
+            - script.stop: enter_sleep
+
+      - lambda: |-
+          if (!brd_power::rtc_state.staying_awake_usb && brd_power::check_usb_sof_incremented()) {
+            brd_power::rtc_state.staying_awake_usb = true;
+            brd_power::rtc_state.update_crc();
+          }
+
+      - if:
+          condition:
+            lambda: 'return brd_power::rtc_state.staying_awake_usb;'
+          then:
+            - logger.log: "USB power is active. Skipping deep sleep."
+            - script.stop: enter_sleep
 
       - lambda: |-
           id(awake_duration_sensor).publish_state(millis() / 1000.0f);
@@ -765,8 +862,12 @@ script:
           }
 
           id(touch).stop_poller();
-          const int gt = brd_power::sleep_gt911_and_hold_int_low(i2c_bus, brd_power::rtc_state.prev_gt911);
-          brd_power::rtc_state.prev_gt911 = gt;
+          const int gt = brd_power::sleep_gt911_and_hold_int_low(
+              i2c_bus, brd_power::rtc_state.last_gt911_addr);
+          brd_power::rtc_state.prev_gt911 = static_cast<int8_t>(gt);
+          if (gt > 0) {
+            brd_power::rtc_state.last_gt911_addr = static_cast<int8_t>(gt);
+          }
           brd_power::rtc_state.prev_slept = true;
           brd_power::rtc_state.update_crc();
 
