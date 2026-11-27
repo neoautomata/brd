@@ -145,7 +145,19 @@ A 2500 mAh battery delivers 353 days of runtime under full refreshes, or 440 to 
 
 The scheduler operates in `local_timezone` (default `UTC`) using `EspHomeTzCalendar` so daylight saving shifts require no `setenv("TZ")` calls.
 During daytime (`07:00` to `22:00` by default), the device wakes on quarter-hour marks (`:00`, `:15`, `:30`, `:45`) with a 120-second lead margin.
-At bedtime, the device arms the PCF8563 hardware alarm for the next morning wake and sleeps all night.
+At bedtime, the scheduler sets the next wake target to the following morning and the device sleeps all night.
+For both daytime and overnight wakes, the firmware arms the PCF8563 hardware alarm whenever the sleep window is between 90 seconds and 86,100 seconds.
+Otherwise, or after a failed RTC write, the firmware falls back to the PCF8563 countdown timer.
+
+### Firmware Configuration Options
+
+Set these optional variables in `brd.yaml` (copied from `firmware/brd-cfg.yaml`) as needed:
+
+| Variable | Default | Purpose |
+| :--- | :--- | :--- |
+| `ntp_server` | `""` | Optional primary SNTP server (replaces slot 0 while keeping `1.pool.ntp.org` and `2.pool.ntp.org` as fallbacks) |
+| `vlogs_host` | `""` | Optional VictoriaLogs base URL for per-wake JSONLine trace logs |
+| `vmetrics_host` | `""` | Optional VictoriaMetrics base URL for per-wake Prometheus telemetry |
 
 ### Firmware Build and Test
 

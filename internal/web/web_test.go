@@ -378,15 +378,16 @@ func TestAssetRoutes(t *testing.T) {
 		want        string
 		wantCT      string
 		wantNoStore bool
+		wantDate    string
 	}{
-		{"/img", "img-today", "application/octet-stream", true},
-		{"/img.sha", "sha-today", "text/plain; charset=utf-8", true},
-		{"/img2", "img-tomorrow", "application/octet-stream", true},
-		{"/img2.sha", "sha-tomorrow", "text/plain; charset=utf-8", true},
-		{"/screenshot", "png-today", "image/png", true},
-		{"/screenshot2", "png-tomorrow", "image/png", true},
-		{"/window_screenshot", "win-today", "image/png", true},
-		{"/ckengine5.css", ".ck-content", "text/css; charset=utf-8", false},
+		{"/img", "img-today", "application/octet-stream", true, today},
+		{"/img.sha", "sha-today", "text/plain; charset=utf-8", true, today},
+		{"/img2", "img-tomorrow", "application/octet-stream", true, tomorrow},
+		{"/img2.sha", "sha-tomorrow", "text/plain; charset=utf-8", true, tomorrow},
+		{"/screenshot", "png-today", "image/png", true, today},
+		{"/screenshot2", "png-tomorrow", "image/png", true, tomorrow},
+		{"/window_screenshot", "win-today", "image/png", true, today},
+		{"/ckengine5.css", ".ck-content", "text/css; charset=utf-8", false, ""},
 	}
 
 	for _, tc := range routes {
@@ -406,6 +407,14 @@ func TestAssetRoutes(t *testing.T) {
 		}
 		if tc.wantNoStore && rr.Header().Get("Cache-Control") != "no-store" {
 			t.Errorf("GET %s Cache-Control = %q, want no-store", tc.path, rr.Header().Get("Cache-Control"))
+		}
+		if tc.wantDate != "" {
+			if gotDate := rr.Header().Get("X-Image-Date"); gotDate != tc.wantDate {
+				t.Errorf("GET %s X-Image-Date = %q, want %q", tc.path, gotDate, tc.wantDate)
+			}
+			if gotTZ := rr.Header().Get("X-Server-Timezone"); gotTZ != "Europe/Zurich" {
+				t.Errorf("GET %s X-Server-Timezone = %q, want Europe/Zurich", tc.path, gotTZ)
+			}
 		}
 	}
 }

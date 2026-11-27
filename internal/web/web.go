@@ -142,10 +142,12 @@ func (s *Server) handleCSS(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) serveDatedFile(dayOffset int, contentType string, pathFn func(string) string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		dateStr := s.nowFn().In(s.cfg.Location).AddDate(0, 0, dayOffset).Format("2006-01-02")
 		w.Header().Set("Content-Type", contentType)
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
-		dateStr := s.nowFn().In(s.cfg.Location).AddDate(0, 0, dayOffset).Format("2006-01-02")
+		w.Header().Set("X-Image-Date", dateStr)
+		w.Header().Set("X-Server-Timezone", s.cfg.Location.String())
 		http.ServeFile(w, r, pathFn(dateStr))
 	}
 }
