@@ -1,0 +1,21 @@
+# Runtime config and secrets
+config.json
+secrets.yaml
+client_secret.json
+token.json
+refresh_tok_obtained.empty
+
+# Compiled binaries and runtime data
+/brd
+data/
+
+# ESPHome build caches
+.esphome/
+firmware/.esphome/
+
+# Coverage, editor, and OS temporary files
+coverage.out
+*.swp
+*.swo
+*~
+.DS_Store
