@@ -12,6 +12,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -30,6 +31,7 @@ const (
 	maxCSRFTokens        = 1024
 	maxUpdateHorizonDays = 365
 	updateRegenTimeout   = 25 * time.Second
+	baselineCSP          = "object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
 )
 
 type csrfEntry struct {
@@ -94,12 +96,19 @@ type Server struct {
 
 // NewServer creates a Server with explicit dependencies.
 func NewServer(deps Dependencies) *Server {
+	if deps.Config == nil {
+		panic("web.NewServer: Config must not be nil")
+	}
+	cfgCopy := *deps.Config
+	if cfgCopy.Location == nil {
+		cfgCopy.Location = time.UTC
+	}
 	nowFn := deps.Now
 	if nowFn == nil {
 		nowFn = time.Now
 	}
 	return &Server{
-		cfg:         deps.Config,
+		cfg:         &cfgCopy,
 		authz:       deps.Authorizer,
 		cal:         deps.Calendar,
 		transit:     deps.Transit,
@@ -109,12 +118,10 @@ func NewServer(deps Dependencies) *Server {
 	}
 }
 
-// Handler returns a dedicated http.ServeMux with all brd routes registered.
+// Handler returns an http.Handler that serves all brd routes.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
-
-	mux.HandleFunc("GET /{$}", s.handleView)
-	mux.HandleFunc("GET /ckengine5.css", s.handleCSS)
+	s.registerReadOnlyRoutes(mux)
 
 	mux.Handle("GET /edit", s.authz.RequireEditor(http.HandlerFunc(s.handleEdit)))
 	mux.Handle("POST /update", s.authz.RequireEditor(http.HandlerFunc(s.handleUpdate)))
@@ -122,21 +129,35 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /newtoken", s.authz.RequireAdmin(http.HandlerFunc(s.handleNewToken)))
 	mux.Handle("GET /savetoken", s.authz.RequireAdmin(http.HandlerFunc(s.handleSaveToken)))
 
+	return withSecurityHeaders(mux)
+}
+
+// ReadOnlyHandler returns an http.Handler that serves only display and asset routes.
+func (s *Server) ReadOnlyHandler() http.Handler {
+	mux := http.NewServeMux()
+	s.registerReadOnlyRoutes(mux)
+	return withSecurityHeaders(mux)
+}
+
+func (s *Server) registerReadOnlyRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("GET /{$}", s.handleView)
+	mux.HandleFunc("GET /ckengine5.css", s.handleCSS)
+
 	mux.HandleFunc("GET /window_screenshot", s.serveDatedFile(0, "image/png", s.cfg.WindowScreenshotPath))
 	mux.HandleFunc("GET /screenshot", s.serveDatedFile(0, "image/png", s.cfg.ScreenshotPath))
 	mux.HandleFunc("GET /img", s.serveDatedFile(0, "application/octet-stream", s.cfg.ImagePath))
+	// The firmware uses /img.sha and /img2.sha only to detect display changes, not as a security integrity check.
+	// The firmware skips local hashing to save CPU time and power.
 	mux.HandleFunc("GET /img.sha", s.serveDatedFile(0, "text/plain; charset=utf-8", s.cfg.HashPath))
 
 	mux.HandleFunc("GET /screenshot2", s.serveDatedFile(1, "image/png", s.cfg.ScreenshotPath))
 	mux.HandleFunc("GET /img2", s.serveDatedFile(1, "application/octet-stream", s.cfg.ImagePath))
 	mux.HandleFunc("GET /img2.sha", s.serveDatedFile(1, "text/plain; charset=utf-8", s.cfg.HashPath))
-
-	return mux
 }
 
 func (s *Server) handleCSS(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/css; charset=utf-8")
-	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Cache-Control", "public, max-age=3600")
 	http.ServeContent(w, r, "ckengine5.css", time.Time{}, bytes.NewReader(cssData))
 }
 
@@ -145,7 +166,6 @@ func (s *Server) serveDatedFile(dayOffset int, contentType string, pathFn func(s
 		dateStr := s.nowFn().In(s.cfg.Location).AddDate(0, 0, dayOffset).Format("2006-01-02")
 		w.Header().Set("Content-Type", contentType)
 		w.Header().Set("Cache-Control", "no-store")
-		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("X-Image-Date", dateStr)
 		w.Header().Set("X-Server-Timezone", s.cfg.Location.String())
 		http.ServeFile(w, r, pathFn(dateStr))
@@ -153,11 +173,6 @@ func (s *Server) serveDatedFile(dayOffset int, contentType string, pathFn func(s
 }
 
 func (s *Server) handleView(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/" {
-		http.NotFound(w, r)
-		return
-	}
-
 	now := s.nowFn().In(s.cfg.Location)
 	t, dateStr, err := s.parseQueryDate(r.URL.Query().Get("date"), now)
 	if err != nil {
@@ -184,15 +199,19 @@ func (s *Server) handleView(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	tokExpiry := ""
+	tokExpiry := "unknown"
 	if s.cal != nil {
-		tokExpiry = s.cal.TokenExpiry()
+		if exp := strings.TrimSpace(s.cal.TokenExpiry()); exp != "" {
+			tokExpiry = exp
+		}
 	}
 
 	lastFullRef, fullRefElapsed := "unknown", "unknown"
 	if fi, err := os.Stat(s.cfg.RefreshTokenFile()); err == nil {
 		lastFullRef = fi.ModTime().In(s.cfg.Location).Format(time.RFC3339)
 		fullRefElapsed = timeutil.FormatElapsed(fi.ModTime(), now)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		log.Printf("Read refresh token marker %s failed: %v", s.cfg.RefreshTokenFile(), err)
 	}
 
 	var transitLines []transit.LineDepartures
@@ -202,7 +221,9 @@ func (s *Server) handleView(w http.ResponseWriter, r *http.Request) {
 
 	todayMidnight := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, s.cfg.Location)
 	targetMidnight := time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, s.cfg.Location)
+	maxDate := todayMidnight.AddDate(0, 0, maxUpdateHorizonDays)
 	showPrev := targetMidnight.After(todayMidnight)
+	showNext := targetMidnight.Before(maxDate)
 
 	prevDate := targetMidnight.AddDate(0, 0, -1).Format("2006-01-02")
 	nextDate := targetMidnight.AddDate(0, 0, 1).Format("2006-01-02")
@@ -210,6 +231,7 @@ func (s *Server) handleView(w http.ResponseWriter, r *http.Request) {
 	data := map[string]any{
 		"dateHeader":         t.Format("Mon, Jan _2"),
 		"showPrev":           showPrev,
+		"showNext":           showNext,
 		"prevURL":            "/?date=" + prevDate,
 		"editURL":            "/edit?date=" + dateStr,
 		"nextURL":            "/?date=" + nextDate,
@@ -226,6 +248,12 @@ func (s *Server) handleView(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleEdit(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
 	now := s.nowFn().In(s.cfg.Location)
 	t, dateStr, err := s.parseQueryDate(r.URL.Query().Get("date"), now)
 	if err != nil {
@@ -260,7 +288,6 @@ func (s *Server) handleEdit(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
-	setDynamicSecurityHeaders(w)
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", http.MethodPost)
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -279,7 +306,8 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	user := auth.UserFromContext(r.Context())
-	if !s.consumeCSRFTokenForUser(r.PostFormValue("csrf_token"), user) {
+	csrfToken := r.PostFormValue("csrf_token")
+	if !s.verifyCSRFTokenForUser(csrfToken, user) {
 		http.Error(w, "Invalid or expired CSRF token", http.StatusForbidden)
 		return
 	}
@@ -314,6 +342,11 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 	validDate := parsed.Format("2006-01-02")
 
+	if !s.consumeCSRFTokenForUser(csrfToken, user) {
+		http.Error(w, "Invalid or expired CSRF token", http.StatusForbidden)
+		return
+	}
+
 	cleanHTML := sanitize.HTML(contents[0])
 	notePath := s.cfg.ContentPath(validDate)
 	if err := atomicfile.Write(notePath, []byte(cleanHTML), 0600); err != nil {
@@ -329,7 +362,7 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		defer cancel()
 		if err := s.regenerator.Regenerate(regenCtx, validDate); err != nil {
 			log.Printf("Regenerate image for %s failed: %v", validDate, err)
-			http.Error(w, "Failed to update display image", http.StatusInternalServerError)
+			http.Error(w, "The server saved the note, but failed to update the display image", http.StatusInternalServerError)
 			return
 		}
 	}
@@ -338,7 +371,6 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleNewToken(w http.ResponseWriter, r *http.Request) {
-	setDynamicSecurityHeaders(w)
 	if r.Method != http.MethodGet {
 		w.Header().Set("Allow", http.MethodGet)
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -352,7 +384,11 @@ func (s *Server) handleNewToken(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleSaveToken(w http.ResponseWriter, r *http.Request) {
-	setDynamicSecurityHeaders(w)
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	if s.cal == nil {
 		http.Error(w, "Calendar service unavailable", http.StatusInternalServerError)
 		return
@@ -371,14 +407,18 @@ func (s *Server) parseQueryDate(raw string, now time.Time) (time.Time, string, e
 	if timeutil.IsPriorDay(parsed, now, s.cfg.Location) {
 		return time.Time{}, "", errors.New("Cannot access prior days")
 	}
+	todayMidnight := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, s.cfg.Location)
+	maxDate := todayMidnight.AddDate(0, 0, maxUpdateHorizonDays)
+	if parsed.After(maxDate) {
+		return time.Time{}, "", errors.New("Cannot access dates more than 365 days ahead")
+	}
 	return parsed, parsed.Format("2006-01-02"), nil
 }
 
-func (s *Server) issueCSRFToken() (string, error) {
-	return s.issueCSRFTokenForUser("")
-}
-
 func (s *Server) issueCSRFTokenForUser(user string) (string, error) {
+	if user == "" {
+		return "", errors.New("CSRF token requires an authenticated user")
+	}
 	buf := make([]byte, csrfTokenBytes)
 	if _, err := rand.Read(buf); err != nil {
 		return "", err
@@ -414,8 +454,16 @@ func (s *Server) issueCSRFTokenForUser(user string) (string, error) {
 	return token, nil
 }
 
+func (s *Server) verifyCSRFTokenForUser(candidate, user string) bool {
+	return s.checkCSRFTokenForUser(candidate, user, false)
+}
+
 func (s *Server) consumeCSRFTokenForUser(candidate, user string) bool {
-	if candidate == "" {
+	return s.checkCSRFTokenForUser(candidate, user, true)
+}
+
+func (s *Server) checkCSRFTokenForUser(candidate, user string, consume bool) bool {
+	if candidate == "" || user == "" {
 		return false
 	}
 	now := s.nowFn()
@@ -428,25 +476,28 @@ func (s *Server) consumeCSRFTokenForUser(candidate, user string) bool {
 			delete(s.csrfTokens, k)
 			continue
 		}
-		if subtle.ConstantTimeCompare([]byte(k), []byte(candidate)) == 1 {
-			if entry.user == "" || entry.user == user {
-				matchedKey = k
-			}
+		if subtle.ConstantTimeCompare([]byte(k), []byte(candidate)) == 1 && entry.user == user {
+			matchedKey = k
 		}
 	}
 	if matchedKey == "" {
 		return false
 	}
-	delete(s.csrfTokens, matchedKey)
+	if consume {
+		delete(s.csrfTokens, matchedKey)
+	}
 	return true
 }
 
-func setDynamicSecurityHeaders(w http.ResponseWriter) {
-	w.Header().Set("Cache-Control", "no-store")
-	w.Header().Set("X-Content-Type-Options", "nosniff")
-	w.Header().Set("X-Frame-Options", "DENY")
-	w.Header().Set("Referrer-Policy", "no-referrer")
-	w.Header().Set("Content-Security-Policy", "frame-ancestors 'none'")
+func withSecurityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		w.Header().Set("Content-Security-Policy", baselineCSP)
+		next.ServeHTTP(w, r)
+	})
 }
 
 func renderTemplate(w http.ResponseWriter, tmpl *htmpl.Template, data map[string]any) {
@@ -457,7 +508,6 @@ func renderTemplate(w http.ResponseWriter, tmpl *htmpl.Template, data map[string
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	setDynamicSecurityHeaders(w)
 	_, _ = w.Write(buf.Bytes())
 }
 

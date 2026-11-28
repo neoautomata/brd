@@ -23,9 +23,13 @@ const (
 	defaultRetentionDays        = 7
 	defaultTransitCacheSeconds  = 600
 	defaultTransitMaxDepartures = 4
+
+	maxRegenIntervalSeconds = 604800 // 7 days
+	maxRetentionDays        = 3650   // 10 years
+	maxTransitCacheSeconds  = 86400  // 24 hours
 )
 
-// TransitConfig holds public transit stationboard settings.
+// TransitConfig holds stationboard settings for public transit.
 type TransitConfig struct {
 	StationboardURL      string   `json:"stationboard_url"`
 	CacheDurationSeconds int      `json:"cache_duration_seconds"`
@@ -50,8 +54,7 @@ type Config struct {
 	TrustWebAuthHeader   bool          `json:"trust_webauth_header"`
 	TrustedProxyTags     []string      `json:"trusted_proxy_tags"`
 	ChromePath           string        `json:"chrome_path"`
-	ChromeDriverPath     string        `json:"chromedriver_path"`
-	ChromeDriverPort     int           `json:"chromedriver_port"`
+	ChromeNoSandbox      bool          `json:"chrome_no_sandbox"`
 	RegenIntervalSeconds int           `json:"regen_interval_seconds"`
 	RetentionDays        int           `json:"retention_days"`
 	AdminUsers           []string      `json:"admin_users"`
@@ -80,7 +83,7 @@ func Load(path string) (*Config, error) {
 }
 
 // Parse decodes raw JSON bytes into a validated Config.
-// Relative paths resolve against baseDir when baseDir is non-empty.
+// Parse resolves relative paths against baseDir when baseDir is not empty.
 func Parse(data []byte, baseDir string) (*Config, error) {
 	cfg := &Config{
 		Timezone:             defaultTimezone,
@@ -125,11 +128,14 @@ func (c *Config) validateAndNormalize(baseDir string) error {
 	}
 	c.DataDir = absDataDir
 
-	loc, err := time.LoadLocation(strings.TrimSpace(c.Timezone))
+	c.Timezone = strings.TrimSpace(c.Timezone)
+	if c.Timezone == "" {
+		return errors.New("timezone must not be empty")
+	}
+	loc, err := time.LoadLocation(c.Timezone)
 	if err != nil {
 		return fmt.Errorf("load timezone %q: %w", c.Timezone, err)
 	}
-	c.Timezone = strings.TrimSpace(c.Timezone)
 	c.Location = loc
 
 	c.TailnetHostname = strings.ToLower(strings.TrimSpace(c.TailnetHostname))
@@ -142,7 +148,7 @@ func (c *Config) validateAndNormalize(baseDir string) error {
 		return err
 	}
 	c.LocalAddr = strings.TrimSpace(c.LocalAddr)
-	if err := validateAddr("local_addr", c.LocalAddr); err != nil {
+	if err := validateLocalAddr("local_addr", c.LocalAddr); err != nil {
 		return err
 	}
 
@@ -155,20 +161,17 @@ func (c *Config) validateAndNormalize(baseDir string) error {
 		c.ChromePath = ""
 	}
 
-	if trimmed := strings.TrimSpace(c.ChromeDriverPath); trimmed != "" {
-		if err := validatePathString("chromedriver_path", trimmed); err != nil {
-			return err
-		}
-		c.ChromeDriverPath = filepath.Clean(trimmed)
-	}
-	if c.ChromeDriverPort != 0 && (c.ChromeDriverPort < 1 || c.ChromeDriverPort > 65535) {
-		return fmt.Errorf("chromedriver_port %d is out of range", c.ChromeDriverPort)
-	}
 	if c.RegenIntervalSeconds <= 0 {
 		return fmt.Errorf("regen_interval_seconds must be positive, got %d", c.RegenIntervalSeconds)
 	}
+	if c.RegenIntervalSeconds > maxRegenIntervalSeconds {
+		return fmt.Errorf("regen_interval_seconds exceeds maximum %d, got %d", maxRegenIntervalSeconds, c.RegenIntervalSeconds)
+	}
 	if c.RetentionDays <= 0 {
 		return fmt.Errorf("retention_days must be positive, got %d", c.RetentionDays)
+	}
+	if c.RetentionDays > maxRetentionDays {
+		return fmt.Errorf("retention_days exceeds maximum %d, got %d", maxRetentionDays, c.RetentionDays)
 	}
 
 	var normErr error
@@ -193,15 +196,25 @@ func (c *Config) validateAndNormalize(baseDir string) error {
 			return fmt.Errorf("trusted_proxy_tags[%d] %q must start with \"tag:\"", i, tag)
 		}
 	}
+	if len(c.TrustedProxyTags) > 0 && !c.TrustWebAuthHeader {
+		return errors.New("trusted_proxy_tags requires trust_webauth_header to be true")
+	}
+	if c.TrustWebAuthHeader && len(c.TrustedProxyTags) == 0 {
+		return errors.New("trust_webauth_header requires at least one entry in trusted_proxy_tags")
+	}
 
 	if c.Transit.CacheDurationSeconds <= 0 {
 		return fmt.Errorf("transit.cache_duration_seconds must be positive, got %d", c.Transit.CacheDurationSeconds)
 	}
+	if c.Transit.CacheDurationSeconds > maxTransitCacheSeconds {
+		return fmt.Errorf("transit.cache_duration_seconds exceeds maximum %d, got %d", maxTransitCacheSeconds, c.Transit.CacheDurationSeconds)
+	}
 	if c.Transit.MaxDepartures <= 0 {
 		return fmt.Errorf("transit.max_departures must be positive, got %d", c.Transit.MaxDepartures)
 	}
-	if strings.TrimSpace(c.Transit.StationboardURL) != "" {
-		u, err := url.Parse(strings.TrimSpace(c.Transit.StationboardURL))
+	c.Transit.StationboardURL = strings.TrimSpace(c.Transit.StationboardURL)
+	if c.Transit.StationboardURL != "" {
+		u, err := url.Parse(c.Transit.StationboardURL)
 		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 			return fmt.Errorf("invalid transit.stationboard_url %q", c.Transit.StationboardURL)
 		}
@@ -226,21 +239,21 @@ func (c *Config) ContentsDir() string { return filepath.Join(c.DataDir, "content
 // ScreenshotsDir returns the directory that stores captured PNG screenshots.
 func (c *Config) ScreenshotsDir() string { return filepath.Join(c.DataDir, "screenshots") }
 
-// ImagesDir returns the directory that stores converted 4bpp display images.
+// ImagesDir returns the directory that stores 4bpp display images.
 func (c *Config) ImagesDir() string { return filepath.Join(c.DataDir, "imgs") }
 
 // TailscaleDir returns the directory that stores tsnet state.
 func (c *Config) TailscaleDir() string { return filepath.Join(c.DataDir, "tailscale") }
 
-// TokenFile returns the path to the OAuth2 token cache file.
+// TokenFile returns the path to the cache file for OAuth2 tokens.
 func (c *Config) TokenFile() string { return filepath.Join(c.DataDir, "token.json") }
 
-// RefreshTokenFile returns the path to the refresh timestamp marker file.
+// RefreshTokenFile returns the path to the marker file for refresh timestamps.
 func (c *Config) RefreshTokenFile() string {
 	return filepath.Join(c.DataDir, "refresh_tok_obtained.empty")
 }
 
-// ClientSecretFile returns the path to the Google OAuth2 client secret file.
+// ClientSecretFile returns the path to the client secret file for Google OAuth2.
 func (c *Config) ClientSecretFile() string { return filepath.Join(c.DataDir, "client_secret.json") }
 
 // ContentPath returns the HTML note path for a YYYY-MM-DD date string.
@@ -248,22 +261,22 @@ func (c *Config) ContentPath(dateStr string) string {
 	return filepath.Join(c.ContentsDir(), dateStr+".html")
 }
 
-// ScreenshotPath returns the cropped element screenshot path for dateStr.
+// ScreenshotPath returns the path to the cropped screenshot for dateStr.
 func (c *Config) ScreenshotPath(dateStr string) string {
 	return filepath.Join(c.ScreenshotsDir(), dateStr+".png")
 }
 
-// WindowScreenshotPath returns the full browser screenshot path for dateStr.
+// WindowScreenshotPath returns the path to the full browser screenshot for dateStr.
 func (c *Config) WindowScreenshotPath(dateStr string) string {
 	return filepath.Join(c.ScreenshotsDir(), dateStr+"_window.png")
 }
 
-// ImagePath returns the converted 4bpp image path for dateStr.
+// ImagePath returns the path to the 4bpp image for dateStr.
 func (c *Config) ImagePath(dateStr string) string {
 	return filepath.Join(c.ImagesDir(), dateStr)
 }
 
-// HashPath returns the SHA-256 digest file path for dateStr.
+// HashPath returns the path to the SHA-256 digest file for dateStr.
 func (c *Config) HashPath(dateStr string) string {
 	return filepath.Join(c.ImagesDir(), dateStr+".sha")
 }
@@ -279,16 +292,35 @@ func validatePathString(field, val string) error {
 	return nil
 }
 
-func validateAddr(field, addr string) error {
-	_, portStr, err := net.SplitHostPort(strings.TrimSpace(addr))
+func splitAndValidateAddr(field, addr string) (string, int, error) {
+	host, portStr, err := net.SplitHostPort(strings.TrimSpace(addr))
 	if err != nil {
-		return fmt.Errorf("invalid %s %q: %w", field, addr, err)
+		return "", 0, fmt.Errorf("invalid %s %q: %w", field, addr, err)
 	}
 	port, err := strconv.Atoi(portStr)
 	if err != nil || port < 1 || port > 65535 {
-		return fmt.Errorf("invalid port in %s %q", field, addr)
+		return "", 0, fmt.Errorf("invalid port in %s %q", field, addr)
 	}
-	return nil
+	return host, port, nil
+}
+
+func validateAddr(field, addr string) error {
+	_, _, err := splitAndValidateAddr(field, addr)
+	return err
+}
+
+func validateLocalAddr(field, addr string) error {
+	host, _, err := splitAndValidateAddr(field, addr)
+	if err != nil {
+		return err
+	}
+	if strings.EqualFold(host, "localhost") {
+		return nil
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		return nil
+	}
+	return fmt.Errorf("%s %q must use a loopback host", field, addr)
 }
 
 func isValidHostname(name string) bool {

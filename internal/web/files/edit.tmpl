@@ -237,15 +237,9 @@
 			const form = document.getElementById("edit-form");
 			const saveBtn = document.getElementById("save-btn");
 			let submitting = false;
-			function resetSubmitState() {
-				submitting = false;
-				saveBtn.disabled = false;
-				saveBtn.removeAttribute("aria-busy");
-				saveBtn.textContent = "Save";
-			}
 			window.addEventListener("pageshow", function (event) {
 				if (event.persisted) {
-					resetSubmitState();
+					window.location.reload();
 				}
 			});
 			form.addEventListener("submit", function (event) {
@@ -273,7 +267,7 @@
 						'-',
 						'fontSize', 'fontFamily', 'fontColor', 'fontBackgroundColor', 'highlight', '|',
 						'alignment', '|',
-						'link', 'insertImage', 'blockQuote', 'insertTable', 'mediaEmbed', 'codeBlock', 'htmlEmbed', '|',
+						'link', 'insertImage', 'blockQuote', 'insertTable', 'codeBlock', '|',
 						'specialCharacters', 'horizontalLine', 'pageBreak', '|',
 						'sourceEditing'
 					],
@@ -315,20 +309,10 @@
 					options: [ 28, 32, 36, 42, 'default', 54, 60, 66, 72 ],
 					supportAllValues: true
 				},
-				htmlEmbed: {
-					showPreviews: false
-				},
 				link: {
 					decorators: {
 						addTargetToExternalLinks: true,
-						defaultProtocol: 'https://',
-						toggleDownloadable: {
-							mode: 'manual',
-							label: 'Downloadable',
-							attributes: {
-								download: 'file'
-							}
-						}
+						defaultProtocol: 'https://'
 					}
 				},
 				removePlugins: [
@@ -342,8 +326,10 @@
 					'ExportPdf',
 					'ExportWord',
 					'FormatPainter',
+					'HtmlEmbed',
 					'ImportWord',
 					'MathType',
+					'MediaEmbed',
 					'MultiLevelList',
 					'Pagination',
 					'PasteFromOfficeEnhanced',

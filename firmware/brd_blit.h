@@ -1,6 +1,5 @@
 #pragma once
 
-#include <cctype>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -8,7 +7,7 @@
 #include <mutex>
 #include <vector>
 
-#if defined(USE_ESP32) && __has_include(<esp_heap_caps.h>)
+#if defined(ESP_PLATFORM) && __has_include(<esp_heap_caps.h>)
 #include <esp_heap_caps.h>
 #endif
 
@@ -37,25 +36,37 @@ constexpr bool is_expected_content_length(size_t content_length, size_t expected
          content_length == expected;
 }
 
-// Non-throwing RAII staging buffer backed by PSRAM on ESP32 when available.
+// Allocate a staging buffer from PSRAM on ESP32 when available.
 class StagingBuffer {
  public:
   explicit StagingBuffer(size_t size) : size_(size) {
     if (size == 0U) {
       return;
     }
-#if defined(USE_ESP32) && __has_include(<esp_heap_caps.h>)
-    this->data_ = static_cast<uint8_t *>(heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    if (this->data_ == nullptr) {
+#if defined(ESP_PLATFORM) && __has_include(<esp_heap_caps.h>)
+    this->data_ =
+        static_cast<uint8_t *>(heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (this->data_ != nullptr) {
+      this->from_heap_caps_ = true;
+    } else {
       this->data_ = static_cast<uint8_t *>(std::malloc(size));
     }
 #else
     this->data_ = static_cast<uint8_t *>(std::malloc(size));
 #endif
+    if (this->data_ == nullptr) {
+      this->size_ = 0U;
+    }
   }
 
   ~StagingBuffer() {
     if (this->data_ != nullptr) {
+#if defined(ESP_PLATFORM) && __has_include(<esp_heap_caps.h>)
+      if (this->from_heap_caps_) {
+        heap_caps_free(this->data_);
+        return;
+      }
+#endif
       std::free(this->data_);
     }
   }
@@ -71,9 +82,12 @@ class StagingBuffer {
  private:
   uint8_t *data_{nullptr};
   size_t size_{0};
+#if defined(ESP_PLATFORM) && __has_include(<esp_heap_caps.h>)
+  bool from_heap_caps_{false};
+#endif
 };
 
-// Copy raw packed 4bpp framebuffer data with bounds verification.
+// Copy a packed 4bpp framebuffer and check its bounds.
 inline BlitResult copy_framebuffer(uint8_t *dst, size_t dst_capacity, const uint8_t *src,
                                    size_t src_len) {
   if (dst == nullptr || src == nullptr) {
@@ -85,23 +99,53 @@ inline BlitResult copy_framebuffer(uint8_t *dst, size_t dst_capacity, const uint
   if (dst_capacity < FRAMEBUFFER_SIZE) {
     return BlitResult::ERROR_TARGET_OVERFLOW;
   }
-  std::memcpy(dst, src, FRAMEBUFFER_SIZE);
+  std::memmove(dst, src, FRAMEBUFFER_SIZE);
   return BlitResult::OK;
 }
 
-// Parse, trim, and normalize SHA-256 hex digest string.
+namespace detail {
+
+constexpr bool is_ascii_space(unsigned char c) {
+  return c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\v' || c == '\f';
+}
+
+constexpr int ascii_hex_value(unsigned char c) {
+  if (c >= '0' && c <= '9') {
+    return static_cast<int>(c - '0');
+  }
+  if (c >= 'a' && c <= 'f') {
+    return static_cast<int>(c - 'a' + 10);
+  }
+  if (c >= 'A' && c <= 'F') {
+    return static_cast<int>(c - 'A' + 10);
+  }
+  return -1;
+}
+
+constexpr char ascii_hex_lower(unsigned char c) {
+  return (c >= 'A' && c <= 'F') ? static_cast<char>(c - 'A' + 'a') : static_cast<char>(c);
+}
+
+}  // namespace detail
+
+// Trim whitespace and convert a SHA-256 hex digest to lowercase.
+// The firmware uses /img.sha only to detect image changes, not as a security check.
+// The firmware does not calculate SHA-256 on the device to save CPU time and power.
 inline bool parse_and_normalize_sha256(const char *input, size_t input_len, char output[65]) {
-  if (input == nullptr || output == nullptr || input_len == 0) {
+  if (output != nullptr) {
+    output[0] = '\0';
+  }
+  if (input == nullptr || output == nullptr || input_len == 0U) {
     return false;
   }
 
-  size_t start = 0;
-  while (start < input_len && std::isspace(static_cast<unsigned char>(input[start]))) {
+  size_t start = 0U;
+  while (start < input_len && detail::is_ascii_space(static_cast<unsigned char>(input[start]))) {
     ++start;
   }
 
   size_t end = input_len;
-  while (end > start && std::isspace(static_cast<unsigned char>(input[end - 1]))) {
+  while (end > start && detail::is_ascii_space(static_cast<unsigned char>(input[end - 1U]))) {
     --end;
   }
 
@@ -110,18 +154,19 @@ inline bool parse_and_normalize_sha256(const char *input, size_t input_len, char
     return false;
   }
 
-  for (size_t i = 0; i < SHA256_HEX_LEN; ++i) {
+  for (size_t i = 0U; i < SHA256_HEX_LEN; ++i) {
     const unsigned char c = static_cast<unsigned char>(input[start + i]);
-    if (!std::isxdigit(c)) {
+    if (detail::ascii_hex_value(c) < 0) {
+      output[0] = '\0';
       return false;
     }
-    output[i] = static_cast<char>(std::tolower(c));
+    output[i] = detail::ascii_hex_lower(c);
   }
   output[SHA256_HEX_LEN] = '\0';
   return true;
 }
 
-// Thread-safe buffer handoff container for image transfer.
+// Store and retrieve a framebuffer safely across threads.
 class BlitBuffer {
  public:
   BlitBuffer() : storage_(FRAMEBUFFER_SIZE, 0) {}

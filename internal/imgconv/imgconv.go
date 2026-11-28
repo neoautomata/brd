@@ -10,6 +10,7 @@ import (
 	_ "image/gif"
 	_ "image/jpeg"
 	_ "image/png"
+	"io"
 	"math"
 	"os"
 
@@ -17,13 +18,17 @@ import (
 )
 
 const (
-	// DefaultWidth is the portrait pixel width of the LilyGO T5 4.7-inch display.
+	// DefaultWidth is the portrait width in pixels for the LilyGO T5 display.
 	DefaultWidth = 540
-	// DefaultHeight is the portrait pixel height of the LilyGO T5 4.7-inch display.
+	// DefaultHeight is the portrait height in pixels for the LilyGO T5 display.
 	DefaultHeight = 960
+
+	maxImageDimension = 16384
+	maxImagePixels    = 64_000_000
+	maxInputFileBytes = 64 << 20 // 64 MiB
 )
 
-// Options configures target portrait dimensions before 90-degree CCW rotation.
+// Options sets the target portrait dimensions before the 90-degree counter-clockwise rotation.
 type Options struct {
 	Width  int
 	Height int
@@ -38,15 +43,28 @@ func (o Options) normalized() (int, int, error) {
 	if h == 0 {
 		h = DefaultHeight
 	}
-	if w < 0 || h < 0 {
-		return 0, 0, fmt.Errorf("invalid target dimensions %dx%d", w, h)
+	if err := validateDimensions("target", w, h); err != nil {
+		return 0, 0, err
 	}
 	return w, h, nil
 }
 
-// Convert fits src to opts.Width x opts.Height, converts it to ITU-R 601-2 grayscale,
-// rotates it 90 degrees counter-clockwise, and packs pixels into 4bpp little-endian nibbles.
-// It returns the raw framebuffer bytes and the 64-character lowercase SHA-256 hex digest.
+func validateDimensions(kind string, w, h int) error {
+	if w <= 0 || h <= 0 {
+		return fmt.Errorf("invalid %s dimensions %dx%d", kind, w, h)
+	}
+	if w > maxImageDimension || h > maxImageDimension {
+		return fmt.Errorf("%s dimensions %dx%d exceed maximum %d", kind, w, h, maxImageDimension)
+	}
+	if int64(w) > int64(maxImagePixels)/int64(h) {
+		return fmt.Errorf("%s pixel count %dx%d exceeds maximum %d", kind, w, h, maxImagePixels)
+	}
+	return nil
+}
+
+// Convert resizes src to opts.Width by opts.Height and converts pixels to ITU-R 601-2 grayscale.
+// It rotates the image 90 degrees counter-clockwise and packs two pixels into each byte.
+// It returns the raw framebuffer bytes and the lowercase SHA-256 digest in hex.
 func Convert(src image.Image, opts Options) ([]byte, string, error) {
 	if src == nil {
 		return nil, "", errors.New("source image is nil")
@@ -54,8 +72,8 @@ func Convert(src image.Image, opts Options) ([]byte, string, error) {
 	bounds := src.Bounds()
 	srcW := bounds.Dx()
 	srcH := bounds.Dy()
-	if srcW <= 0 || srcH <= 0 {
-		return nil, "", fmt.Errorf("source image has empty dimensions %dx%d", srcW, srcH)
+	if err := validateDimensions("source", srcW, srcH); err != nil {
+		return nil, "", err
 	}
 
 	targetW, targetH, err := opts.normalized()
@@ -63,12 +81,11 @@ func Convert(src image.Image, opts Options) ([]byte, string, error) {
 		return nil, "", err
 	}
 
-	// Build an 8-bit grayscale portrait buffer of size targetW x targetH.
+	// Build a portrait buffer of 8-bit grayscale pixels with size targetW by targetH.
 	gray := fitToGrayscale(src, targetW, targetH)
 
-	// Rotate 90 degrees counter-clockwise:
-	// Destination dimensions are dstW = targetH, dstH = targetW.
-	// Source mapping: srcX = targetW - 1 - dstY, srcY = dstX.
+	// Rotate 90 degrees counter-clockwise so dstW equals targetH and dstH equals targetW.
+	// Map each output pixel to srcX = targetW - 1 - dstY and srcY = dstX.
 	dstW := targetH
 	dstH := targetW
 	rowBytes := (dstW + 1) / 2
@@ -102,16 +119,38 @@ func Convert(src image.Image, opts Options) ([]byte, string, error) {
 	return raw, hex.EncodeToString(sum[:]), nil
 }
 
-// ConvertFile decodes an image from inPath, converts it to 4bpp format, and writes
-// both outPath and outPath+".sha" atomically with 0600 permissions.
+// ConvertFile decodes an image from inPath and writes the 4bpp output to outPath.
+// It also writes the SHA-256 digest to outPath+".sha" with 0600 permissions.
+// The firmware uses this digest only to detect display changes, not as a security integrity check.
+// The firmware skips local hashing to save CPU time and power.
 func ConvertFile(inPath, outPath string, opts Options) error {
+	if _, _, err := opts.normalized(); err != nil {
+		return err
+	}
+
 	f, err := os.Open(inPath)
 	if err != nil {
 		return fmt.Errorf("open input image: %w", err)
 	}
 	defer f.Close()
 
-	src, _, err := image.Decode(f)
+	if info, err := f.Stat(); err == nil && info.Mode().IsRegular() && info.Size() > maxInputFileBytes {
+		return fmt.Errorf("input image exceeds maximum size %d bytes", maxInputFileBytes)
+	}
+
+	cfg, _, err := image.DecodeConfig(io.LimitReader(f, maxInputFileBytes))
+	if err != nil {
+		return fmt.Errorf("decode input image header: %w", err)
+	}
+	if err := validateDimensions("source", cfg.Width, cfg.Height); err != nil {
+		return err
+	}
+
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("rewind input image: %w", err)
+	}
+
+	src, _, err := image.Decode(io.LimitReader(f, maxInputFileBytes))
 	if err != nil {
 		return fmt.Errorf("decode input image: %w", err)
 	}
@@ -130,14 +169,14 @@ func ConvertFile(inPath, outPath string, opts Options) error {
 	return nil
 }
 
-// fitToGrayscale performs center-crop and bilinear resize (matching ImageOps.fit)
-// and converts each pixel to 8-bit grayscale using ITU-R 601-2 luma weights.
+// fitToGrayscale crops src from its center and resizes it with bilinear interpolation.
+// It converts each pixel to 8-bit grayscale with ITU-R 601-2 weights.
 func fitToGrayscale(src image.Image, targetW, targetH int) []uint8 {
 	b := src.Bounds()
 	srcW := b.Dx()
 	srcH := b.Dy()
 
-	// Fast path: exact dimensions require no cropping or resampling.
+	// Exact dimensions need no crop or resize.
 	if srcW == targetW && srcH == targetH {
 		out := make([]uint8, targetW*targetH)
 		for y := 0; y < targetH; y++ {
@@ -148,7 +187,7 @@ func fitToGrayscale(src image.Image, targetW, targetH int) []uint8 {
 		return out
 	}
 
-	// Compute centered crop box matching target aspect ratio.
+	// Calculate a centered crop box that matches the target aspect ratio.
 	cropX := 0.0
 	cropY := 0.0
 	cropW := float64(srcW)
@@ -157,12 +196,12 @@ func fitToGrayscale(src image.Image, targetW, targetH int) []uint8 {
 	srcAspect := cropW / cropH
 	dstAspect := float64(targetW) / float64(targetH)
 	if srcAspect > dstAspect {
-		// Source is wider than target: trim left and right edges.
+		// Trim the left and right edges when src is wider than the target.
 		newW := cropH * dstAspect
 		cropX = (cropW - newW) / 2.0
 		cropW = newW
 	} else if srcAspect < dstAspect {
-		// Source is taller than target: trim top and bottom edges.
+		// Trim the top and bottom edges when src is taller than the target.
 		newH := cropW / dstAspect
 		cropY = (cropH - newH) / 2.0
 		cropH = newH
@@ -216,15 +255,27 @@ func fitToGrayscale(src image.Image, targetW, targetH int) []uint8 {
 	return out
 }
 
-// toLuma composites c over white using its alpha channel and applies ITU-R 601-2 luma weights.
+// toLuma composites c over white in 16-bit premultiplied space.
+// It clamps RGB channels to alpha and applies ITU-R 601-2 weights.
 func toLuma(c color.Color) uint8 {
-	n := color.NRGBAModel.Convert(c).(color.NRGBA)
-	a := int(n.A)
-	inv := 255 - a
-	r := (int(n.R)*a + 255*inv + 127) / 255
-	g := (int(n.G)*a + 255*inv + 127) / 255
-	b := (int(n.B)*a + 255*inv + 127) / 255
-	luma := (299*r + 587*g + 114*b + 500) / 1000
+	r16, g16, b16, a16 := c.RGBA()
+	if r16 > a16 {
+		r16 = a16
+	}
+	if g16 > a16 {
+		g16 = a16
+	}
+	if b16 > a16 {
+		b16 = a16
+	}
+
+	inv := 0xFFFF - a16
+	r := uint64(r16 + inv)
+	g := uint64(g16 + inv)
+	b := uint64(b16 + inv)
+
+	// Scale 16-bit luma directly to [0, 255] with single-step rounding (65535 = 255 * 257).
+	luma := (299*r + 587*g + 114*b + 128500) / 257000
 	if luma > 255 {
 		return 255
 	}

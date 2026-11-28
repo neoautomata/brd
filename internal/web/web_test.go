@@ -18,9 +18,11 @@ import (
 )
 
 type stubCalendar struct {
-	html   string
-	err    error
-	expiry string
+	html            string
+	err             error
+	expiry          string
+	redirectCalled  *bool
+	saveTokenCalled *bool
 }
 
 func (s stubCalendar) RenderHTML(_ context.Context, _ time.Time) (string, error) {
@@ -28,9 +30,15 @@ func (s stubCalendar) RenderHTML(_ context.Context, _ time.Time) (string, error)
 }
 func (s stubCalendar) TokenExpiry() string { return s.expiry }
 func (s stubCalendar) RedirectForToken(w http.ResponseWriter, _ *http.Request) {
+	if s.redirectCalled != nil {
+		*s.redirectCalled = true
+	}
 	w.WriteHeader(http.StatusSeeOther)
 }
 func (s stubCalendar) ProcessAuthCode(w http.ResponseWriter, _ *http.Request) {
+	if s.saveTokenCalled != nil {
+		*s.saveTokenCalled = true
+	}
 	w.WriteHeader(http.StatusSeeOther)
 }
 
@@ -78,7 +86,7 @@ func newTestServer(t *testing.T, regen *stubRegen) (*Server, *config.Config) {
 		Config:      cfg,
 		Authorizer:  authz,
 		Calendar:    stubCalendar{html: "<ul><li>Meeting</li></ul>", expiry: "2026-06-15T11:00:00+02:00"},
-		Transit:     stubTransit{lines: []transit.LineDepartures{{Line: "9", Next: "10:05"}, {Line: "14", Next: "10:10"}}},
+		Transit:     stubTransit{lines: []transit.LineDepartures{{Line: "9", Next: "10:05"}, {Line: "14", Next: "10:10"}, {Line: "32", Next: "10:15"}}},
 		Regenerator: regen,
 		Now:         func() time.Time { return fixedNow },
 	})
@@ -95,9 +103,40 @@ func extractCSRF(t *testing.T, body string) string {
 	return m[1]
 }
 
+func TestNewServerGuardsConfigAndDefaultsLocation(t *testing.T) {
+	t.Run("nil Config panics", func(t *testing.T) {
+		defer func() {
+			if r := recover(); r == nil {
+				t.Fatal("expected panic when deps.Config is nil")
+			}
+		}()
+		NewServer(Dependencies{})
+	})
+
+	t.Run("nil Location defaults to UTC without mutating caller config", func(t *testing.T) {
+		cfg := &config.Config{DataDir: t.TempDir()}
+		srv := NewServer(Dependencies{Config: cfg})
+		if srv.cfg.Location != time.UTC {
+			t.Errorf("srv.cfg.Location = %v, want UTC", srv.cfg.Location)
+		}
+		if cfg.Location != nil {
+			t.Errorf("caller cfg.Location was mutated to %v", cfg.Location)
+		}
+	})
+}
+
 func TestViewComputesServerLinksAndPreservesDimensions(t *testing.T) {
-	srv, _ := newTestServer(t, &stubRegen{})
+	srv, cfg := newTestServer(t, &stubRegen{})
 	h := srv.Handler()
+
+	// Seed RefreshTokenFile to verify elapsed display.
+	refTime := time.Date(2026, 6, 15, 7, 30, 0, 0, cfg.Location)
+	if err := os.WriteFile(cfg.RefreshTokenFile(), nil, 0600); err != nil {
+		t.Fatalf("write refresh token marker: %v", err)
+	}
+	if err := os.Chtimes(cfg.RefreshTokenFile(), refTime, refTime); err != nil {
+		t.Fatalf("chtimes refresh token marker: %v", err)
+	}
 
 	// Today: no Prev link, Edit and Next present
 	rr := httptest.NewRecorder()
@@ -125,6 +164,9 @@ func TestViewComputesServerLinksAndPreservesDimensions(t *testing.T) {
 	if !strings.Contains(body, "height: 960px") || !strings.Contains(body, "width: 540px") {
 		t.Error("expected #screenshot_content 540x960 dimensions preserved")
 	}
+	if strings.Contains(body, "#ww_2315453e4f5da") {
+		t.Error("view.tmpl still contains hardcoded #ww_2315453e4f5da selector")
+	}
 	for _, want := range []string{
 		`<html lang="en">`,
 		`<meta name="viewport" content="width=device-width, initial-scale=1">`,
@@ -134,10 +176,17 @@ func TestViewComputesServerLinksAndPreservesDimensions(t *testing.T) {
 		`<footer `,
 		`:focus-visible`,
 		`prefers-reduced-motion`,
+		`<div class="weather-widget">`,
+		`.weather-widget [id^="ww_"]`,
+		`(last 2026-06-15T07:30:00&#43;02:00, elapsed 02:30)`,
 	} {
 		if !strings.Contains(body, want) {
-			t.Errorf("GET / missing expected accessibility/layout marker %q", want)
+			t.Errorf("GET / missing expected marker %q", want)
 		}
+	}
+	// Transit spacing: 3 lines should have 2 divs with padding-top: 5px.
+	if got := strings.Count(body, `style="padding-top: 5px;"`); got != 2 {
+		t.Errorf("transit padding-top count = %d, want 2", got)
 	}
 
 	// Tomorrow: Prev link appears
@@ -150,11 +199,223 @@ func TestViewComputesServerLinksAndPreservesDimensions(t *testing.T) {
 		t.Error("expected Prev link pointing to today")
 	}
 
-	// Yesterday: rejected
+	// Yesterday: rejected with 400 and security headers
 	rr3 := httptest.NewRecorder()
 	h.ServeHTTP(rr3, httptest.NewRequest(http.MethodGet, "/?date=2026-06-14", nil))
 	if rr3.Code != http.StatusBadRequest {
 		t.Errorf("prior day status = %d, want 400", rr3.Code)
+	}
+	assertSecurityHeaders(t, "GET / prior day 400", rr3)
+}
+
+func TestViewAndEditHorizonLimit(t *testing.T) {
+	srv, _ := newTestServer(t, &stubRegen{})
+	h := srv.Handler()
+
+	// Exactly +365 days (2026-06-15 + 365 days = 2027-06-15): allowed on / and /edit; Next link hidden on /.
+	rrAtMax := httptest.NewRecorder()
+	h.ServeHTTP(rrAtMax, httptest.NewRequest(http.MethodGet, "/?date=2027-06-15", nil))
+	if rrAtMax.Code != http.StatusOK {
+		t.Fatalf("GET / at +365 days status = %d, want 200", rrAtMax.Code)
+	}
+	if strings.Contains(rrAtMax.Body.String(), `id="nextdaylink"`) {
+		t.Error("expected Next link hidden at +365 days")
+	}
+
+	editAtMaxReq := httptest.NewRequest(http.MethodGet, "/edit?date=2027-06-15", nil)
+	editAtMaxReq.Header.Set("X-Webauth-User", "editor@example.com")
+	editAtMaxRR := httptest.NewRecorder()
+	h.ServeHTTP(editAtMaxRR, editAtMaxReq)
+	if editAtMaxRR.Code != http.StatusOK {
+		t.Fatalf("GET /edit at +365 days status = %d, want 200", editAtMaxRR.Code)
+	}
+
+	// +366 days (2027-06-16): rejected with 400 on / and /edit.
+	rrOver := httptest.NewRecorder()
+	h.ServeHTTP(rrOver, httptest.NewRequest(http.MethodGet, "/?date=2027-06-16", nil))
+	if rrOver.Code != http.StatusBadRequest {
+		t.Errorf("GET / at +366 days status = %d, want 400", rrOver.Code)
+	}
+
+	editOverReq := httptest.NewRequest(http.MethodGet, "/edit?date=2027-06-16", nil)
+	editOverReq.Header.Set("X-Webauth-User", "editor@example.com")
+	editOverRR := httptest.NewRecorder()
+	h.ServeHTTP(editOverRR, editOverReq)
+	if editOverRR.Code != http.StatusBadRequest {
+		t.Errorf("GET /edit at +366 days status = %d, want 400", editOverRR.Code)
+	}
+}
+
+func TestReadOnlyHandlerExposesOnlyDisplayAndAssets(t *testing.T) {
+	srv, cfg := newTestServer(t, &stubRegen{})
+	ro := srv.ReadOnlyHandler()
+
+	today := "2026-06-15"
+	if err := os.WriteFile(cfg.ImagePath(today), []byte("img-bytes"), 0600); err != nil {
+		t.Fatalf("write img: %v", err)
+	}
+
+	for _, path := range []string{"/", "/ckengine5.css", "/img"} {
+		rr := httptest.NewRecorder()
+		ro.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, path, nil))
+		if rr.Code != http.StatusOK {
+			t.Errorf("ReadOnlyHandler GET %s status = %d, want 200", path, rr.Code)
+		}
+	}
+
+	blocked := []struct {
+		method string
+		path   string
+	}{
+		{http.MethodGet, "/edit"},
+		{http.MethodPost, "/update"},
+		{http.MethodGet, "/newtoken"},
+		{http.MethodGet, "/savetoken"},
+	}
+	for _, tc := range blocked {
+		req := httptest.NewRequest(tc.method, tc.path, nil)
+		req.Header.Set("X-Webauth-User", "admin@example.com")
+		rr := httptest.NewRecorder()
+		ro.ServeHTTP(rr, req)
+		if rr.Code != http.StatusNotFound {
+			t.Errorf("ReadOnlyHandler %s %s status = %d, want 404", tc.method, tc.path, rr.Code)
+		}
+		assertSecurityHeaders(t, "ReadOnlyHandler 404 "+tc.path, rr)
+	}
+}
+
+func TestNilOptionalDepsAndCalendarErrorFallback(t *testing.T) {
+	dir := t.TempDir()
+	cfg, err := config.Parse([]byte(`{
+		"data_dir": "`+dir+`",
+		"admin_users": ["admin@example.com"]
+	}`), "")
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	authz := auth.NewAuthorizer(cfg.AdminUsers, nil, auth.HeaderResolver{})
+
+	t.Run("nil calendar transit regenerator and Now", func(t *testing.T) {
+		srv := NewServer(Dependencies{
+			Config:     cfg,
+			Authorizer: authz,
+		})
+		h := srv.Handler()
+
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/", nil))
+		if rr.Code != http.StatusOK {
+			t.Fatalf("GET / status = %d, want 200", rr.Code)
+		}
+		if !strings.Contains(rr.Body.String(), "Access token expires: unknown") {
+			t.Errorf("expected unknown token expiry, body: %s", rr.Body.String())
+		}
+
+		for _, path := range []string{"/newtoken", "/savetoken"} {
+			req := httptest.NewRequest(http.MethodGet, path, nil)
+			req.Header.Set("X-Webauth-User", "admin@example.com")
+			tokRR := httptest.NewRecorder()
+			h.ServeHTTP(tokRR, req)
+			if tokRR.Code != http.StatusInternalServerError {
+				t.Errorf("GET %s with nil calendar status = %d, want 500", path, tokRR.Code)
+			}
+			assertSecurityHeaders(t, "GET "+path+" 500", tokRR)
+		}
+	})
+
+	t.Run("calendar error renders fallback and empty expiry renders unknown", func(t *testing.T) {
+		srv := NewServer(Dependencies{
+			Config:     cfg,
+			Authorizer: authz,
+			Calendar:   stubCalendar{err: errors.New("oauth expired"), expiry: ""},
+		})
+		rr := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/", nil))
+		if rr.Code != http.StatusOK {
+			t.Fatalf("GET / status = %d, want 200", rr.Code)
+		}
+		body := rr.Body.String()
+		if !strings.Contains(body, "Calendar unavailable") {
+			t.Error("expected Calendar unavailable fallback")
+		}
+		if !strings.Contains(body, "Access token expires: unknown") {
+			t.Error("expected unknown when TokenExpiry returns empty string")
+		}
+	})
+}
+
+func TestHandleNewTokenAndSaveToken(t *testing.T) {
+	dir := t.TempDir()
+	cfg, err := config.Parse([]byte(`{
+		"data_dir": "`+dir+`",
+		"admin_users": ["admin@example.com"],
+		"editor_users": ["editor@example.com"]
+	}`), "")
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	authz := auth.NewAuthorizer(cfg.AdminUsers, cfg.EditorUsers, auth.HeaderResolver{})
+	redirectCalled := false
+	saveTokenCalled := false
+	srv := NewServer(Dependencies{
+		Config:     cfg,
+		Authorizer: authz,
+		Calendar: stubCalendar{
+			redirectCalled:  &redirectCalled,
+			saveTokenCalled: &saveTokenCalled,
+		},
+	})
+	h := srv.Handler()
+
+	// Admin GET /newtoken succeeds.
+	req := httptest.NewRequest(http.MethodGet, "/newtoken", nil)
+	req.Header.Set("X-Webauth-User", "admin@example.com")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusSeeOther || !redirectCalled {
+		t.Errorf("GET /newtoken status=%d called=%v, want 303/true", rr.Code, redirectCalled)
+	}
+
+	// HEAD /savetoken rejected with 405 and does not invoke ProcessAuthCode.
+	headReq := httptest.NewRequest(http.MethodHead, "/savetoken?code=abc", nil)
+	headReq.Header.Set("X-Webauth-User", "admin@example.com")
+	headRR := httptest.NewRecorder()
+	h.ServeHTTP(headRR, headReq)
+	if headRR.Code != http.StatusMethodNotAllowed {
+		t.Errorf("HEAD /savetoken status = %d, want 405", headRR.Code)
+	}
+	if headRR.Header().Get("Allow") != http.MethodGet {
+		t.Errorf("HEAD /savetoken Allow = %q, want GET", headRR.Header().Get("Allow"))
+	}
+	if saveTokenCalled {
+		t.Error("HEAD /savetoken invoked ProcessAuthCode")
+	}
+
+	// Editor GET /savetoken rejected with 403 and security headers.
+	edReq := httptest.NewRequest(http.MethodGet, "/savetoken?code=abc", nil)
+	edReq.Header.Set("X-Webauth-User", "editor@example.com")
+	edRR := httptest.NewRecorder()
+	h.ServeHTTP(edRR, edReq)
+	if edRR.Code != http.StatusForbidden {
+		t.Errorf("editor GET /savetoken status = %d, want 403", edRR.Code)
+	}
+	assertSecurityHeaders(t, "editor /savetoken 403", edRR)
+
+	// Unauthenticated GET /savetoken rejected with 401 and security headers.
+	unauthRR := httptest.NewRecorder()
+	h.ServeHTTP(unauthRR, httptest.NewRequest(http.MethodGet, "/savetoken?code=abc", nil))
+	if unauthRR.Code != http.StatusUnauthorized {
+		t.Errorf("unauth GET /savetoken status = %d, want 401", unauthRR.Code)
+	}
+	assertSecurityHeaders(t, "unauth /savetoken 401", unauthRR)
+
+	// Admin GET /savetoken succeeds.
+	okReq := httptest.NewRequest(http.MethodGet, "/savetoken?code=abc", nil)
+	okReq.Header.Set("X-Webauth-User", "admin@example.com")
+	okRR := httptest.NewRecorder()
+	h.ServeHTTP(okRR, okReq)
+	if okRR.Code != http.StatusSeeOther || !saveTokenCalled {
+		t.Errorf("admin GET /savetoken status=%d called=%v, want 303/true", okRR.Code, saveTokenCalled)
 	}
 }
 
@@ -162,6 +423,24 @@ func TestEditorCanEditAndUpdateWithCSRFAndSanitization(t *testing.T) {
 	regen := &stubRegen{}
 	srv, cfg := newTestServer(t, regen)
 	h := srv.Handler()
+
+	// HEAD /edit rejected with 405 and does not mint CSRF tokens.
+	headEdit := httptest.NewRequest(http.MethodHead, "/edit?date=2026-06-15", nil)
+	headEdit.Header.Set("X-Webauth-User", "editor@example.com")
+	headEditRR := httptest.NewRecorder()
+	h.ServeHTTP(headEditRR, headEdit)
+	if headEditRR.Code != http.StatusMethodNotAllowed {
+		t.Errorf("HEAD /edit status = %d, want 405", headEditRR.Code)
+	}
+	if headEditRR.Header().Get("Allow") != http.MethodGet {
+		t.Errorf("HEAD /edit Allow = %q, want GET", headEditRR.Header().Get("Allow"))
+	}
+	srv.csrfMu.Lock()
+	tokenCountAfterHead := len(srv.csrfTokens)
+	srv.csrfMu.Unlock()
+	if tokenCountAfterHead != 0 {
+		t.Errorf("HEAD /edit minted %d CSRF tokens, want 0", tokenCountAfterHead)
+	}
 
 	// Editor opens /edit
 	if err := os.WriteFile(cfg.ContentPath("2026-06-15"), []byte(`<p>Existing</p><script>evil()</script>`), 0600); err != nil {
@@ -190,15 +469,17 @@ func TestEditorCanEditAndUpdateWithCSRFAndSanitization(t *testing.T) {
 		`ckeditor5/41.4.2/super-build/ckeditor.js`,
 		`integrity="sha384-`,
 		`crossorigin="anonymous"`,
-		`showPreviews: false`,
 		`pageshow`,
+		`window.location.reload()`,
 	} {
 		if !strings.Contains(editBody, want) {
 			t.Errorf("GET /edit missing expected accessibility/layout/security marker %q", want)
 		}
 	}
-	if strings.Contains(editBody, "evil()") {
-		t.Error("GET /edit rendered unsanitized script from note file")
+	for _, unwanted := range []string{"evil()", "mediaEmbed", "htmlEmbed", "toggleDownloadable"} {
+		if strings.Contains(editBody, unwanted) {
+			t.Errorf("GET /edit unexpectedly contains %q", unwanted)
+		}
 	}
 	csrf := extractCSRF(t, editBody)
 
@@ -217,7 +498,21 @@ func TestEditorCanEditAndUpdateWithCSRFAndSanitization(t *testing.T) {
 		t.Errorf("cross-user CSRF status = %d, want 403", crossRR.Code)
 	}
 
-	// Editor posts /update with XSS payload
+	// Bad form submission (missing contents) returns 400 and preserves CSRF token for retry.
+	badFieldsForm := url.Values{
+		"date":       {"2026-06-15"},
+		"csrf_token": {csrf},
+	}
+	badFieldsReq := httptest.NewRequest(http.MethodPost, "/update", strings.NewReader(badFieldsForm.Encode()))
+	badFieldsReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	badFieldsReq.Header.Set("X-Webauth-User", "editor@example.com")
+	badFieldsRR := httptest.NewRecorder()
+	h.ServeHTTP(badFieldsRR, badFieldsReq)
+	if badFieldsRR.Code != http.StatusBadRequest {
+		t.Errorf("missing contents status = %d, want 400", badFieldsRR.Code)
+	}
+
+	// Editor posts /update with XSS payload using the still-valid CSRF token.
 	form := url.Values{
 		"date":       {"2026-06-15"},
 		"csrf_token": {csrf},
@@ -235,6 +530,16 @@ func TestEditorCanEditAndUpdateWithCSRFAndSanitization(t *testing.T) {
 		t.Errorf("regenerator date = %q, want 2026-06-15", regen.calledDate)
 	}
 
+	// Replaying the consumed CSRF token fails with 403.
+	replayReq := httptest.NewRequest(http.MethodPost, "/update", strings.NewReader(form.Encode()))
+	replayReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	replayReq.Header.Set("X-Webauth-User", "editor@example.com")
+	replayRR := httptest.NewRecorder()
+	h.ServeHTTP(replayRR, replayReq)
+	if replayRR.Code != http.StatusForbidden {
+		t.Errorf("replayed CSRF status = %d, want 403", replayRR.Code)
+	}
+
 	saved, err := os.ReadFile(cfg.ContentPath("2026-06-15"))
 	if err != nil {
 		t.Fatalf("read saved note: %v", err)
@@ -244,10 +549,22 @@ func TestEditorCanEditAndUpdateWithCSRFAndSanitization(t *testing.T) {
 	}
 }
 
-func TestUpdateSecurityGuards(t *testing.T) {
+func TestUpdateSecurityGuardsAndEdgeCases(t *testing.T) {
 	regen := &stubRegen{err: errors.New("/secret/path/internal-helper: stderr leak")}
-	srv, _ := newTestServer(t, regen)
+	srv, cfg := newTestServer(t, regen)
 	h := srv.Handler()
+
+	// Empty user cannot mint or consume CSRF tokens.
+	if _, err := srv.issueCSRFTokenForUser(""); err == nil {
+		t.Error("issueCSRFTokenForUser(\"\") succeeded, want error")
+	}
+	validTok, err := srv.issueCSRFTokenForUser("admin@example.com")
+	if err != nil {
+		t.Fatalf("issueCSRFTokenForUser: %v", err)
+	}
+	if srv.consumeCSRFTokenForUser(validTok, "") {
+		t.Error("consumeCSRFTokenForUser with empty user succeeded, want false")
+	}
 
 	// GET /update rejected with 405
 	getReq := httptest.NewRequest(http.MethodGet, "/update", nil)
@@ -257,6 +574,7 @@ func TestUpdateSecurityGuards(t *testing.T) {
 	if getRR.Code != http.StatusMethodNotAllowed {
 		t.Errorf("GET /update status = %d, want 405", getRR.Code)
 	}
+	assertSecurityHeaders(t, "GET /update 405", getRR)
 
 	// Missing CSRF rejected with 403
 	badForm := url.Values{"date": {"2026-06-15"}, "contents": {"hi"}}
@@ -268,6 +586,7 @@ func TestUpdateSecurityGuards(t *testing.T) {
 	if csrfRR.Code != http.StatusForbidden {
 		t.Errorf("missing CSRF status = %d, want 403", csrfRR.Code)
 	}
+	assertSecurityHeaders(t, "POST /update missing CSRF 403", csrfRR)
 
 	// Oversized body rejected with 413
 	bigReq := httptest.NewRequest(http.MethodPost, "/update", strings.NewReader(strings.Repeat("a", maxUpdateBodyBytes+64)))
@@ -279,12 +598,29 @@ func TestUpdateSecurityGuards(t *testing.T) {
 		t.Errorf("oversized body status = %d, want 413", bigRR.Code)
 	}
 
-	// Regenerator error does not leak internal paths
-	csrf, err := srv.issueCSRFToken()
-	if err != nil {
-		t.Fatalf("issueCSRFToken: %v", err)
+	// Validation edge cases with valid CSRF: missing date, invalid date, prior day.
+	for _, tc := range []struct {
+		name string
+		form url.Values
+	}{
+		{"missing date", url.Values{"csrf_token": {validTok}, "contents": {"hi"}}},
+		{"invalid date", url.Values{"csrf_token": {validTok}, "date": {"not-a-date"}, "contents": {"hi"}}},
+		{"prior day", url.Values{"csrf_token": {validTok}, "date": {"2026-06-14"}, "contents": {"hi"}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/update", strings.NewReader(tc.form.Encode()))
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			req.Header.Set("X-Webauth-User", "admin@example.com")
+			rr := httptest.NewRecorder()
+			h.ServeHTTP(rr, req)
+			if rr.Code != http.StatusBadRequest {
+				t.Errorf("%s status = %d, want 400", tc.name, rr.Code)
+			}
+		})
 	}
-	okForm := url.Values{"date": {"2026-06-15"}, "csrf_token": {csrf}, "contents": {"hello"}}
+
+	// Regenerator error saves note, informs user note was saved, and does not leak internal paths.
+	okForm := url.Values{"date": {"2026-06-15"}, "csrf_token": {validTok}, "contents": {"<p>Saved note</p>"}}
 	errReq := httptest.NewRequest(http.MethodPost, "/update", strings.NewReader(okForm.Encode()))
 	errReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	errReq.Header.Set("X-Webauth-User", "admin@example.com")
@@ -293,8 +629,16 @@ func TestUpdateSecurityGuards(t *testing.T) {
 	if errRR.Code != http.StatusInternalServerError {
 		t.Errorf("regen failure status = %d, want 500", errRR.Code)
 	}
+	assertSecurityHeaders(t, "POST /update regen failure 500", errRR)
 	if strings.Contains(errRR.Body.String(), "/secret/path") {
 		t.Errorf("HTTP response leaked internal path: %q", errRR.Body.String())
+	}
+	if !strings.Contains(errRR.Body.String(), "The server saved the note, but failed to update the display image") {
+		t.Errorf("regen failure body = %q, want indication that the server saved the note", errRR.Body.String())
+	}
+	saved, err := os.ReadFile(cfg.ContentPath("2026-06-15"))
+	if err != nil || string(saved) != "<p>Saved note</p>" {
+		t.Errorf("note on disk after regen error = (%q, %v), want <p>Saved note</p>", string(saved), err)
 	}
 
 	// Editor blocked from /newtoken (admin-only)
@@ -314,7 +658,9 @@ func TestUpdateSecurityGuards(t *testing.T) {
 		{http.MethodPost, "/img"},
 		{http.MethodPost, "/"},
 		{http.MethodPost, "/edit"},
+		{http.MethodHead, "/edit"},
 		{http.MethodHead, "/newtoken"},
+		{http.MethodHead, "/savetoken"},
 	} {
 		req := httptest.NewRequest(tc.method, tc.path, nil)
 		req.Header.Set("X-Webauth-User", "admin@example.com")
@@ -337,9 +683,9 @@ func TestDatePathTraversalAndNoFileCreationOnGet(t *testing.T) {
 		t.Errorf("path traversal status = %d, want 400", rr.Code)
 	}
 
-	// Future date GET does not create files on disk
+	// Valid future date within 365 days does not create files on disk
 	rr2 := httptest.NewRecorder()
-	h.ServeHTTP(rr2, httptest.NewRequest(http.MethodGet, "/?date=2099-01-01", nil))
+	h.ServeHTTP(rr2, httptest.NewRequest(http.MethodGet, "/?date=2026-07-01", nil))
 	if rr2.Code != http.StatusOK {
 		t.Fatalf("future date GET status = %d, want 200", rr2.Code)
 	}
@@ -425,9 +771,9 @@ func TestUpdateFutureDateHorizonAndSelectiveRegen(t *testing.T) {
 	h := srv.Handler()
 
 	// Date more than 365 days ahead is rejected with 400.
-	csrf1, err := srv.issueCSRFToken()
+	csrf1, err := srv.issueCSRFTokenForUser("editor@example.com")
 	if err != nil {
-		t.Fatalf("issueCSRFToken: %v", err)
+		t.Fatalf("issueCSRFTokenForUser: %v", err)
 	}
 	farForm := url.Values{
 		"date":       {"2028-01-01"},
@@ -447,9 +793,9 @@ func TestUpdateFutureDateHorizonAndSelectiveRegen(t *testing.T) {
 	}
 
 	// Date 5 days ahead saves note without triggering browser regeneration.
-	csrf2, err := srv.issueCSRFToken()
+	csrf2, err := srv.issueCSRFTokenForUser("editor@example.com")
 	if err != nil {
-		t.Fatalf("issueCSRFToken: %v", err)
+		t.Fatalf("issueCSRFTokenForUser: %v", err)
 	}
 	nextWeekForm := url.Values{
 		"date":       {"2026-06-20"},
@@ -473,9 +819,9 @@ func TestUpdateFutureDateHorizonAndSelectiveRegen(t *testing.T) {
 	}
 
 	// Tomorrow triggers regeneration.
-	csrf3, err := srv.issueCSRFToken()
+	csrf3, err := srv.issueCSRFTokenForUser("editor@example.com")
 	if err != nil {
-		t.Fatalf("issueCSRFToken: %v", err)
+		t.Fatalf("issueCSRFTokenForUser: %v", err)
 	}
 	tmrForm := url.Values{
 		"date":       {"2026-06-16"},
@@ -502,7 +848,7 @@ func assertSecurityHeaders(t *testing.T, label string, rr *httptest.ResponseReco
 		"X-Content-Type-Options":  "nosniff",
 		"X-Frame-Options":         "DENY",
 		"Referrer-Policy":         "no-referrer",
-		"Content-Security-Policy": "frame-ancestors 'none'",
+		"Content-Security-Policy": baselineCSP,
 	}
 	for k, want := range wants {
 		if got := rr.Header().Get(k); got != want {
@@ -511,8 +857,23 @@ func assertSecurityHeaders(t *testing.T, label string, rr *httptest.ResponseReco
 	}
 }
 
-func TestCSRFTokenMapBounded(t *testing.T) {
-	srv, _ := newTestServer(t, &stubRegen{})
+func TestCSRFTokenMapBoundedAndExpiry(t *testing.T) {
+	now := time.Date(2026, 6, 15, 10, 0, 0, 0, time.UTC)
+	cfg := &config.Config{DataDir: t.TempDir()}
+	srv := NewServer(Dependencies{
+		Config: cfg,
+		Now:    func() time.Time { return now },
+	})
+
+	tok, err := srv.issueCSRFTokenForUser("editor@example.com")
+	if err != nil {
+		t.Fatalf("issueCSRFTokenForUser: %v", err)
+	}
+	now = now.Add(csrfTokenTTL + time.Minute)
+	if srv.verifyCSRFTokenForUser(tok, "editor@example.com") {
+		t.Error("expired CSRF token verified as valid")
+	}
+
 	for i := 0; i < maxCSRFTokens+25; i++ {
 		if _, err := srv.issueCSRFTokenForUser("editor@example.com"); err != nil {
 			t.Fatalf("issueCSRFTokenForUser: %v", err)

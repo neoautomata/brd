@@ -12,7 +12,7 @@
 #include "../brd_rtc.h"
 #include "../brd_power.h"
 
-// Mock I2C implementation for testing retries and register protocol.
+// Simulate an I2C bus to check retries, write order, and register state.
 class MockI2cBus : public brd_rtc::I2cPort {
  public:
   struct Operation {
@@ -23,57 +23,105 @@ class MockI2cBus : public brd_rtc::I2cPort {
 
   std::vector<Operation> history;
   uint8_t registers[256]{};
+  bool override_read[256]{};
+  uint8_t override_val[256]{};
   int fail_count{0};
+  int fail_read_count{0};
   bool inject_readback_mismatch{false};
+  bool decrement_timer_on_start{false};
 
   MockI2cBus() {
     std::memset(this->registers, 0, sizeof(this->registers));
+    std::memset(this->override_read, 0, sizeof(this->override_read));
+    std::memset(this->override_val, 0, sizeof(this->override_val));
+  }
+
+  void clear_read_overrides() {
+    std::memset(this->override_read, 0, sizeof(this->override_read));
+    std::memset(this->override_val, 0, sizeof(this->override_val));
   }
 
   bool write(uint8_t address, const uint8_t *data, size_t len) override {
+    if (data == nullptr && len > 0) {
+      return false;
+    }
     if (this->fail_count > 0) {
       this->fail_count--;
       return false;
     }
-    this->history.push_back({address, std::vector<uint8_t>(data, data + len), false});
     if (len >= 1) {
-      uint8_t reg = data[0];
-      for (size_t i = 1; i < len; ++i) {
-        this->registers[reg + (i - 1)] = data[i];
+      const size_t reg = static_cast<size_t>(data[0]);
+      if (reg + (len - 1) > sizeof(this->registers)) {
+        return false;
       }
+      this->history.push_back({address, std::vector<uint8_t>(data, data + len), false});
+      for (size_t i = 1; i < len; ++i) {
+        const size_t target_reg = reg + (i - 1);
+        this->registers[target_reg] = data[i];
+        if (this->decrement_timer_on_start && target_reg == 0x0E && (data[i] & 0x80U) != 0 &&
+            this->registers[0x0F] > 0U) {
+          this->registers[0x0F]--;
+        }
+      }
+    } else {
+      this->history.push_back({address, {}, false});
     }
     return true;
   }
 
   bool write_read(uint8_t address, const uint8_t *write_data, size_t write_len,
                   uint8_t *read_data, size_t read_len) override {
+    if ((write_data == nullptr && write_len > 0) || (read_data == nullptr && read_len > 0)) {
+      return false;
+    }
     if (this->fail_count > 0) {
       this->fail_count--;
       return false;
     }
-    this->history.push_back({address, std::vector<uint8_t>(write_data, write_data + write_len), true});
+    if (this->fail_read_count > 0) {
+      this->fail_read_count--;
+      return false;
+    }
     if (write_len >= 1 && read_len > 0) {
-      uint8_t reg = write_data[0];
+      const size_t reg = static_cast<size_t>(write_data[0]);
+      if (reg + read_len > sizeof(this->registers)) {
+        return false;
+      }
+      this->history.push_back(
+          {address, std::vector<uint8_t>(write_data, write_data + write_len), true});
       for (size_t i = 0; i < read_len; ++i) {
         if (this->inject_readback_mismatch) {
           read_data[i] = 0xFF;
+        } else if (this->override_read[reg + i]) {
+          read_data[i] = this->override_val[reg + i];
         } else {
           read_data[i] = this->registers[reg + i];
         }
       }
+    } else {
+      this->history.push_back(
+          {address,
+           write_data != nullptr ? std::vector<uint8_t>(write_data, write_data + write_len)
+                                 : std::vector<uint8_t>{},
+           true});
     }
     return true;
   }
 };
 
 static void test_blit_bounds_and_errors() {
-  printf("[TEST] brd_blit framebuffer copy and bounds verification...\n");
+  printf("[TEST] brd_blit framebuffer copy and bounds checks...\n");
 
   std::vector<uint8_t> dst(brd_blit::FRAMEBUFFER_SIZE);
   std::vector<uint8_t> src(brd_blit::FRAMEBUFFER_SIZE, 0xAB);
 
   // Exact size copy succeeds.
   auto res = brd_blit::copy_framebuffer(dst.data(), dst.size(), src.data(), src.size());
+  assert(res == brd_blit::BlitResult::OK);
+  assert(dst[0] == 0xAB && dst[brd_blit::FRAMEBUFFER_SIZE - 1] == 0xAB);
+
+  // Overlapping self-copy succeeds safely via memmove.
+  res = brd_blit::copy_framebuffer(dst.data(), dst.size(), dst.data(), dst.size());
   assert(res == brd_blit::BlitResult::OK);
   assert(dst[0] == 0xAB && dst[brd_blit::FRAMEBUFFER_SIZE - 1] == 0xAB);
 
@@ -131,22 +179,32 @@ static void test_blit_sha256_normalizer() {
   assert(brd_blit::parse_and_normalize_sha256(mixed_ws, strlen(mixed_ws), out));
   assert(std::strcmp(out, valid_lower) == 0);
 
-  // Null and empty checks fail.
+  // Null and empty checks fail and NUL-terminate output.
+  std::memset(out, 'X', sizeof(out));
   assert(!brd_blit::parse_and_normalize_sha256(nullptr, 64, out));
+  assert(out[0] == '\0');
+  std::memset(out, 'X', sizeof(out));
   assert(!brd_blit::parse_and_normalize_sha256(valid_lower, 0, out));
+  assert(out[0] == '\0');
   assert(!brd_blit::parse_and_normalize_sha256(valid_lower, 64, nullptr));
 
-  // Too short input fails.
+  // Too short input fails and NUL-terminates output.
   const char *short_sha = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b85";
+  std::memset(out, 'X', sizeof(out));
   assert(!brd_blit::parse_and_normalize_sha256(short_sha, strlen(short_sha), out));
+  assert(out[0] == '\0');
 
-  // Too long input fails.
+  // Too long input fails and NUL-terminates output.
   const char *long_sha = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855aa";
+  std::memset(out, 'X', sizeof(out));
   assert(!brd_blit::parse_and_normalize_sha256(long_sha, strlen(long_sha), out));
+  assert(out[0] == '\0');
 
-  // Invalid non-hex characters fail.
-  const char *invalid_hex = "g3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+  // Invalid non-hex characters fail and NUL-terminate output.
+  const char *invalid_hex = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b85g";
+  std::memset(out, 'X', sizeof(out));
   assert(!brd_blit::parse_and_normalize_sha256(invalid_hex, strlen(invalid_hex), out));
+  assert(out[0] == '\0');
 
   printf("  -> Passed SHA-256 normalizer checks.\n");
 }
@@ -159,10 +217,18 @@ static void test_blit_thread_safe_buffer() {
 
   std::vector<uint8_t> data(brd_blit::FRAMEBUFFER_SIZE, 0x42);
 
+  // Reject null pointers and mismatched sizes.
+  assert(!buffer.store(nullptr, data.size()));
+  assert(!buffer.store(data.data(), data.size() - 1));
+  assert(!buffer.store(data.data(), data.size() + 1));
+  assert(!buffer.is_valid());
+
   assert(buffer.store(data.data(), data.size()));
   assert(buffer.is_valid());
 
   std::vector<uint8_t> read_back(brd_blit::FRAMEBUFFER_SIZE, 0x00);
+  assert(!buffer.retrieve(nullptr, read_back.size()));
+  assert(!buffer.retrieve(read_back.data(), read_back.size() - 1));
   assert(buffer.retrieve(read_back.data(), read_back.size()));
   assert(read_back[0] == 0x42 && read_back[brd_blit::FRAMEBUFFER_SIZE - 1] == 0x42);
 
@@ -413,11 +479,57 @@ static void test_schedule_dst_and_boundaries() {
   assert(plan_reval_upgraded.clock_valid);
   assert(plan_reval_upgraded.target_epoch == plan_spring.target_epoch);
 
-  // Test Revalidation: remaining time < 90s recomputes schedule.
+  // Check Revalidation: remaining time < 90s recomputes schedule.
   auto plan_reval_stale = brd_schedule::revalidate_before_sleep(cal, plan_spring.target_epoch - 30, plan_spring, cfg);
   assert(plan_reval_stale.target_epoch != plan_spring.target_epoch);
 
-  // Verify default ScheduleConfig (07:00..22:00) in UTC across daytime and overnight.
+  // Check Revalidation: now_epoch <= 0 returns fallback with sleep_seconds >= 60.
+  brd_schedule::SchedulePlan tiny_plan = plan_spring;
+  tiny_plan.sleep_seconds = 0;
+  brd_schedule::ScheduleConfig small_fallback_cfg = cfg;
+  small_fallback_cfg.fallback_sleep_sec = 10;
+  auto plan_reval_zero_now =
+      brd_schedule::revalidate_before_sleep(cal, 0, tiny_plan, small_fallback_cfg);
+  assert(!plan_reval_zero_now.clock_valid);
+  assert(!plan_reval_zero_now.arm_alarm);
+  assert(plan_reval_zero_now.sleep_seconds >= brd_schedule::MIN_FALLBACK_SLEEP_SEC);
+
+  auto plan_reval_neg_now =
+      brd_schedule::revalidate_before_sleep(cal, -100, tiny_plan, small_fallback_cfg);
+  assert(!plan_reval_neg_now.clock_valid);
+  assert(plan_reval_neg_now.sleep_seconds >= brd_schedule::MIN_FALLBACK_SLEEP_SEC);
+
+  // Check Revalidation: remaining < 0 (clock jumped forward past target) recomputes.
+  auto plan_reval_past =
+      brd_schedule::revalidate_before_sleep(cal, plan_spring.target_epoch + 120, plan_spring, cfg);
+  assert(plan_reval_past.clock_valid);
+  assert(plan_reval_past.target_epoch > plan_spring.target_epoch + 120);
+  assert(plan_reval_past.sleep_seconds >= static_cast<uint32_t>(cfg.lead_margin_sec));
+
+  // Check Revalidation: remaining > max_alarm_lead_sec (clock jumped backward) recomputes.
+  brd_schedule::SchedulePlan far_future_plan = plan_spring;
+  far_future_plan.target_epoch = epoch_spring + 200000;
+  auto plan_reval_far = brd_schedule::revalidate_before_sleep(cal, epoch_spring, far_future_plan, cfg);
+  assert(plan_reval_far.clock_valid);
+  assert(plan_reval_far.target_epoch == plan_spring.target_epoch);
+  assert(plan_reval_far.sleep_seconds == plan_spring.sleep_seconds);
+
+  printf("  -> Passed DST and schedule boundary checks.\n");
+}
+
+static void test_schedule_dst_edge_cases() {
+  printf("[TEST] brd_schedule DST 23:30, 00:15, ambiguous hour, and config bounds...\n");
+
+  brd_schedule::PosixTzCalendar cal("CET-1CEST,M3.5.0,M10.5.0/3");
+  brd_schedule::PosixTzCalendar cal_utc;
+  brd_schedule::ScheduleConfig cfg;
+  cfg.wake_hour = 6;
+  cfg.wake_minute = 20;
+  cfg.sleep_hour = 21;
+  cfg.sleep_minute = 45;
+  brd_schedule::WallTime local_target;
+
+  // Check default ScheduleConfig (07:00..22:00) in UTC across daytime and overnight.
   brd_schedule::ScheduleConfig default_cfg;
   int64_t utc_day = 0;
   assert(cal_utc.local_to_epoch({2026, 7, 15, 12, 10, 0}, utc_day));
@@ -432,7 +544,7 @@ static void test_schedule_dst_and_boundaries() {
   assert(std::strcmp(plan_utc_night.mode, "alarm") == 0);
   assert(plan_utc_night.target_utc_hour == 7 && plan_utc_night.target_utc_minute == 0);
 
-  // Verify 21:45 -> 06:20 overnight UTC wake hour/minute explicitly in CET (05:20 UTC) and CEST (04:20 UTC).
+  // Check 21:45 -> 06:20 overnight UTC wake hour/minute in CET (05:20 UTC) and CEST (04:20 UTC).
   int64_t cet_night = 0;
   assert(cal.local_to_epoch({2026, 1, 15, 21, 45, 0}, cet_night));
   const auto plan_cet_night = brd_schedule::plan_next_wake(cal, cet_night, cfg);
@@ -443,8 +555,9 @@ static void test_schedule_dst_and_boundaries() {
   assert(cal.local_to_epoch({2026, 7, 15, 21, 45, 0}, cest_night));
   const auto plan_cest_night = brd_schedule::plan_next_wake(cal, cest_night, cfg);
   assert(plan_cest_night.arm_alarm);
+  assert(plan_cest_night.target_utc_hour == 4 && plan_cest_night.target_utc_minute == 20);
 
-  // Verify 24h alarm wrap safety margin (diff >= max_alarm_lead_sec disables absolute alarm).
+  // Check 24h alarm wrap safety margin (diff >= max_alarm_lead_sec disables absolute alarm).
   brd_schedule::ScheduleConfig tight_window_cfg = default_cfg;
   tight_window_cfg.wake_hour = 7;
   tight_window_cfg.wake_minute = 0;
@@ -460,7 +573,7 @@ static void test_schedule_dst_and_boundaries() {
       brd_schedule::revalidate_before_sleep(cal_utc, near_wrap, plan_near_wrap, tight_window_cfg);
   assert(!reval_near_wrap.arm_alarm);
 
-  // Verify interval > 60 minutes normalizes cleanly across hours.
+  // Check interval > 60 minutes normalizes cleanly across hours.
   brd_schedule::ScheduleConfig wide_cfg = default_cfg;
   wide_cfg.boundary_interval_min = 90;
   int64_t utc_wide = 0;
@@ -468,7 +581,142 @@ static void test_schedule_dst_and_boundaries() {
   const auto plan_wide = brd_schedule::plan_next_wake(cal_utc, utc_wide, wide_cfg);
   assert(plan_wide.clock_valid && plan_wide.arm_alarm);
   assert(plan_wide.target_utc_hour == 11 && plan_wide.target_utc_minute == 30);
-  assert(plan_cest_night.target_utc_hour == 4 && plan_cest_night.target_utc_minute == 20);
+
+  // Check DST spring-forward 23:30 (March 28 -> March 29 06:20 CEST, 23-hour day).
+  int64_t spring_eve_2330 = 0;
+  assert(cal.local_to_epoch({2026, 3, 28, 23, 30, 0}, spring_eve_2330));
+  const auto plan_spring_eve = brd_schedule::plan_next_wake(cal, spring_eve_2330, cfg);
+  assert(plan_spring_eve.clock_valid && plan_spring_eve.arm_alarm);
+  assert(std::strcmp(plan_spring_eve.mode, "alarm") == 0);
+  assert(cal.epoch_to_local(plan_spring_eve.target_epoch, local_target));
+  assert(local_target.year == 2026 && local_target.month == 3 && local_target.day == 29);
+  assert(local_target.hour == 6 && local_target.minute == 20 && local_target.second == 0);
+  assert(plan_spring_eve.sleep_seconds == 21000U);  // 5h50m across 02:00->03:00 jump.
+
+  // Check DST spring-forward evening 23:30 on March 29 -> March 30 06:20 CEST.
+  int64_t spring_day_2330 = 0;
+  assert(cal.local_to_epoch({2026, 3, 29, 23, 30, 0}, spring_day_2330));
+  const auto plan_spring_day_2330 = brd_schedule::plan_next_wake(cal, spring_day_2330, cfg);
+  assert(plan_spring_day_2330.clock_valid && plan_spring_day_2330.arm_alarm);
+  assert(cal.epoch_to_local(plan_spring_day_2330.target_epoch, local_target));
+  assert(local_target.month == 3 && local_target.day == 30);
+  assert(local_target.hour == 6 && local_target.minute == 20);
+  assert(plan_spring_day_2330.sleep_seconds == 24600U);
+
+  // Check DST fall-back 00:15 (Oct 25, 25-hour day) for both morning wake and next-day advance.
+  int64_t fall_0015 = 0;
+  assert(cal.local_to_epoch({2026, 10, 25, 0, 15, 0}, fall_0015));
+  const auto plan_fall_0015 = brd_schedule::plan_next_wake(cal, fall_0015, cfg);
+  assert(plan_fall_0015.clock_valid && plan_fall_0015.arm_alarm);
+  assert(cal.epoch_to_local(plan_fall_0015.target_epoch, local_target));
+  assert(local_target.month == 10 && local_target.day == 25);
+  assert(local_target.hour == 6 && local_target.minute == 20);
+  assert(plan_fall_0015.sleep_seconds == 25500U);  // 7h05m across 03:00->02:00 repeat.
+
+  // Check civil day increment when wake_epoch <= now_epoch at 00:15 on 25-hour fall-back day.
+  brd_schedule::ScheduleConfig early_wake_cfg = cfg;
+  early_wake_cfg.wake_hour = 0;
+  early_wake_cfg.wake_minute = 10;
+  early_wake_cfg.sleep_hour = 0;
+  early_wake_cfg.sleep_minute = 12;
+  const auto plan_fall_nextday = brd_schedule::plan_next_wake(cal, fall_0015, early_wake_cfg);
+  assert(plan_fall_nextday.clock_valid);
+  assert(plan_fall_nextday.target_epoch > fall_0015);
+  assert(plan_fall_nextday.sleep_seconds == 89700U);  // 24h55m -> Oct 26 00:10 CET.
+  assert(cal.epoch_to_local(plan_fall_nextday.target_epoch, local_target));
+  assert(local_target.month == 10 && local_target.day == 26);
+  assert(local_target.hour == 0 && local_target.minute == 10);
+
+  // Check DST fall-back ambiguous hour 02:00..02:59 (both CEST and CET occurrences).
+  brd_schedule::ScheduleConfig all_day_cfg = default_cfg;
+  all_day_cfg.wake_hour = 0;
+  all_day_cfg.wake_minute = 0;
+  all_day_cfg.sleep_hour = 23;
+  all_day_cfg.sleep_minute = 0;
+  int64_t fall_ambig_start_utc = 0;
+  assert(cal_utc.local_to_epoch({2026, 10, 25, 0, 0, 0}, fall_ambig_start_utc));  // 02:00 CEST
+  for (int interval : {15, 5}) {
+    all_day_cfg.boundary_interval_min = interval;
+    // Sweep every 5 minutes across both 02:00..02:59 CEST (00:00..00:55 UTC) and CET (01:00..01:55 UTC).
+    for (int mins = 0; mins < 120; mins += 5) {
+      const int64_t now_ep = fall_ambig_start_utc + static_cast<int64_t>(mins) * 60;
+      const auto p = brd_schedule::plan_next_wake(cal, now_ep, all_day_cfg);
+      assert(p.clock_valid);
+      assert(p.target_epoch > now_ep);
+      assert(p.sleep_seconds >= static_cast<uint32_t>(all_day_cfg.lead_margin_sec));
+    }
+  }
+
+  // Check small interval (1 min) with large lead margin (300 s) steps forward safely.
+  brd_schedule::ScheduleConfig small_int_cfg = default_cfg;
+  small_int_cfg.boundary_interval_min = 1;
+  small_int_cfg.lead_margin_sec = 300;
+  const auto plan_small_int = brd_schedule::plan_next_wake(cal_utc, utc_day, small_int_cfg);
+  assert(plan_small_int.clock_valid);
+  assert(plan_small_int.sleep_seconds >= 300U);
+
+  // Check plan_next_wake fails closed when MAX_BOUNDARY_STEPS cannot reach lead_margin_sec.
+  brd_schedule::ScheduleConfig exhausted_cfg = default_cfg;
+  exhausted_cfg.boundary_interval_min = 1;
+  exhausted_cfg.lead_margin_sec = 4000;
+  exhausted_cfg.fallback_sleep_sec = 900;
+  const auto plan_exhausted = brd_schedule::plan_next_wake(cal_utc, utc_day, exhausted_cfg);
+  assert(!plan_exhausted.clock_valid && !plan_exhausted.arm_alarm);
+  assert(plan_exhausted.target_epoch == 0);
+  assert(plan_exhausted.sleep_seconds == 900U);
+
+  // Check invalid ScheduleConfig fields return clamped fallback plan.
+  brd_schedule::ScheduleConfig invalid_cfg = default_cfg;
+  invalid_cfg.fallback_sleep_sec = 10;
+  invalid_cfg.wake_hour = 24;
+  assert(!brd_schedule::is_valid_schedule_config(invalid_cfg));
+  auto plan_bad_cfg = brd_schedule::plan_next_wake(cal_utc, utc_day, invalid_cfg);
+  assert(!plan_bad_cfg.clock_valid && !plan_bad_cfg.arm_alarm);
+  assert(plan_bad_cfg.sleep_seconds == brd_schedule::MIN_FALLBACK_SLEEP_SEC);
+
+  invalid_cfg = default_cfg;
+  invalid_cfg.sleep_hour = -1;
+  assert(!brd_schedule::is_valid_schedule_config(invalid_cfg));
+  plan_bad_cfg = brd_schedule::plan_next_wake(cal_utc, utc_day, invalid_cfg);
+  assert(!plan_bad_cfg.clock_valid);
+
+  invalid_cfg = default_cfg;
+  invalid_cfg.wake_minute = 60;
+  assert(!brd_schedule::is_valid_schedule_config(invalid_cfg));
+  plan_bad_cfg = brd_schedule::plan_next_wake(cal_utc, utc_day, invalid_cfg);
+  assert(!plan_bad_cfg.clock_valid);
+
+  invalid_cfg = default_cfg;
+  invalid_cfg.sleep_minute = 60;
+  assert(!brd_schedule::is_valid_schedule_config(invalid_cfg));
+  plan_bad_cfg = brd_schedule::plan_next_wake(cal_utc, utc_day, invalid_cfg);
+  assert(!plan_bad_cfg.clock_valid);
+
+  // Check is_valid_schedule_config rejects sleep_sec <= wake_sec.
+  invalid_cfg = default_cfg;
+  invalid_cfg.wake_hour = 7;
+  invalid_cfg.wake_minute = 0;
+  invalid_cfg.sleep_hour = 7;
+  invalid_cfg.sleep_minute = 0;
+  assert(!brd_schedule::is_valid_schedule_config(invalid_cfg));
+  plan_bad_cfg = brd_schedule::plan_next_wake(cal_utc, utc_day, invalid_cfg);
+  assert(!plan_bad_cfg.clock_valid && !plan_bad_cfg.arm_alarm);
+
+  invalid_cfg.wake_hour = 22;
+  invalid_cfg.wake_minute = 0;
+  invalid_cfg.sleep_hour = 7;
+  invalid_cfg.sleep_minute = 0;
+  assert(!brd_schedule::is_valid_schedule_config(invalid_cfg));
+  plan_bad_cfg = brd_schedule::plan_next_wake(cal_utc, utc_day, invalid_cfg);
+  assert(!plan_bad_cfg.clock_valid && !plan_bad_cfg.arm_alarm);
+
+  invalid_cfg.wake_hour = 7;
+  invalid_cfg.wake_minute = 30;
+  invalid_cfg.sleep_hour = 7;
+  invalid_cfg.sleep_minute = 15;
+  assert(!brd_schedule::is_valid_schedule_config(invalid_cfg));
+  plan_bad_cfg = brd_schedule::plan_next_wake(cal_utc, utc_day, invalid_cfg);
+  assert(!plan_bad_cfg.clock_valid && !plan_bad_cfg.arm_alarm);
 
   printf("  -> Passed DST and schedule boundary checks.\n");
 }
@@ -483,7 +731,7 @@ static void test_rtc_bcd_and_retries() {
     assert(dec == i);
   }
 
-  // Test compute_esphome_weekday across Sunday, Saturday, Monday, leap day, and invalid inputs.
+  // Check compute_esphome_weekday across Sunday, Saturday, Monday, leap day, and invalid dates.
   assert(brd_rtc::compute_esphome_weekday(2026, 11, 15) == 1);  // Sunday
   assert(brd_rtc::compute_esphome_weekday(2026, 11, 16) == 2);  // Monday
   assert(brd_rtc::compute_esphome_weekday(2026, 11, 14) == 7);  // Saturday
@@ -491,29 +739,41 @@ static void test_rtc_bcd_and_retries() {
   assert(brd_rtc::compute_esphome_weekday(2026, 0, 15) == 0);
   assert(brd_rtc::compute_esphome_weekday(2026, 13, 15) == 0);
   assert(brd_rtc::compute_esphome_weekday(2026, 11, 0) == 0);
+  assert(brd_rtc::compute_esphome_weekday(2026, 2, 30) == 0);
+  assert(brd_rtc::compute_esphome_weekday(2025, 2, 29) == 0);
+  assert(brd_rtc::compute_esphome_weekday(2026, 4, 31) == 0);
 
   MockI2cBus mock;
 
-  // Test 3-attempt bounded retry success.
+  // Check MockI2cBus bounds guards reject out-of-range register writes and reads.
+  const uint8_t oob_write[4] = {0xFE, 0x01, 0x02, 0x03};
+  assert(!mock.write(0x51, oob_write, sizeof(oob_write)));
+  uint8_t oob_read[4]{};
+  const uint8_t oob_reg = 0xFE;
+  assert(!mock.write_read(0x51, &oob_reg, 1, oob_read, sizeof(oob_read)));
+
+  // Check 3-attempt bounded retry success.
   mock.fail_count = 2;
   const uint8_t test_data[2] = {0x01, 0x00};
   assert(brd_rtc::retry_write(mock, 0x51, test_data, 2));
 
-  // Test 3-attempt bounded retry exhaustion.
+  // Check 3-attempt bounded retry exhaustion.
   mock.fail_count = 3;
   assert(!brd_rtc::retry_write(mock, 0x51, test_data, 2));
 
-  // Test read_and_clear_status_and_disable_clkout.
+  // Check read_and_clear_status_and_disable_clkout clears Control_status_1 (STOP/TEST), 0x01, and 0x0D.
   mock.fail_count = 0;
+  mock.registers[0x00] = 0xA8;  // TEST1 + STOP + TESTC bits set
   mock.registers[0x01] = 0x0C;
   mock.registers[0x0D] = 0x80;
   brd_rtc::RtcStatus status;
   assert(brd_rtc::read_and_clear_status_and_disable_clkout(mock, 0x51, status));
   assert(status.alarm_flag && status.timer_flag);
+  assert(mock.registers[0x00] == 0x00);
   assert(mock.registers[0x01] == 0x00);
   assert(mock.registers[0x0D] == 0x00);
 
-  // Test write_utc_clock_only writes ESPTime weekday 1..7 (2026-11-16 is Monday -> 2).
+  // Check write_utc_clock_only writes ESPTime weekday 1..7 (2026-11-16 is Monday -> 2).
   brd_rtc::UtcClock clk;
   clk.year = 2026;
   clk.month = 11;
@@ -532,7 +792,7 @@ static void test_rtc_bcd_and_retries() {
   assert(mock.registers[0x08] == brd_rtc::dec_to_bcd(26));
   assert(mock.registers[0x0D] == 0x00);
 
-  // Test write_utc_clock_only writes 1 for Sunday, clears VL bit, and clears STOP bit.
+  // Check write_utc_clock_only writes 1 for Sunday, clears VL bit, and clears STOP bit.
   mock.registers[0x00] = 0x20;  // STOP=1
   clk.year = 2026;
   clk.month = 11;
@@ -543,7 +803,7 @@ static void test_rtc_bcd_and_retries() {
   assert(mock.registers[0x06] == 1);
   assert((mock.registers[0x02] & 0x80) == 0);
 
-  // Test write_utc_clock_only rejects out-of-range fields.
+  // Check write_utc_clock_only rejects out-of-range fields and impossible calendar dates.
   brd_rtc::UtcClock bad_clk = clk;
   bad_clk.year = 1999;
   assert(!brd_rtc::write_utc_clock_only(mock, 0x51, bad_clk));
@@ -556,8 +816,17 @@ static void test_rtc_bcd_and_retries() {
   bad_clk = clk;
   bad_clk.second = 60;
   assert(!brd_rtc::write_utc_clock_only(mock, 0x51, bad_clk));
+  bad_clk = clk;
+  bad_clk.year = 2026;
+  bad_clk.month = 2;
+  bad_clk.day = 30;
+  assert(!brd_rtc::write_utc_clock_only(mock, 0x51, bad_clk));
+  bad_clk.year = 2025;
+  bad_clk.month = 2;
+  bad_clk.day = 29;
+  assert(!brd_rtc::write_utc_clock_only(mock, 0x51, bad_clk));
 
-  // Test repair_sunday_weekday_if_valid repairs 0 -> 1 when VL == 0 on Sunday 2026-11-15.
+  // Check repair_sunday_weekday_if_valid repairs 0 -> 1 when VL == 0 on Sunday 2026-11-15.
   mock.registers[0x02] = brd_rtc::dec_to_bcd(10);  // VL == 0
   mock.registers[0x05] = brd_rtc::dec_to_bcd(15);
   mock.registers[0x06] = 0;  // Midnight rollover from Saturday 7 -> 0
@@ -566,13 +835,46 @@ static void test_rtc_bcd_and_retries() {
   assert(brd_rtc::repair_sunday_weekday_if_valid(mock, 0x51));
   assert(mock.registers[0x06] == 1);
 
-  // Test repair_sunday_weekday_if_valid leaves register untouched when VL == 1.
-  mock.registers[0x02] = static_cast<uint8_t>(0x80 | brd_rtc::dec_to_bcd(10));  // VL == 1
+  // Check repair_sunday_weekday_if_valid skips invalid calendar date (2026-02-30).
+  mock.registers[0x02] = brd_rtc::dec_to_bcd(10);
+  mock.registers[0x05] = brd_rtc::dec_to_bcd(30);
   mock.registers[0x06] = 0;
+  mock.registers[0x07] = brd_rtc::dec_to_bcd(2);
+  mock.registers[0x08] = brd_rtc::dec_to_bcd(26);
   assert(brd_rtc::repair_sunday_weekday_if_valid(mock, 0x51));
   assert(mock.registers[0x06] == 0);
 
-  // Test arm_wake in alarm mode.
+  // Check repair_sunday_weekday_if_valid leaves register untouched when VL == 1.
+  mock.registers[0x02] = static_cast<uint8_t>(0x80 | brd_rtc::dec_to_bcd(10));  // VL == 1
+  mock.registers[0x05] = brd_rtc::dec_to_bcd(15);
+  mock.registers[0x06] = 0;
+  mock.registers[0x07] = brd_rtc::dec_to_bcd(11);
+  mock.registers[0x08] = brd_rtc::dec_to_bcd(26);
+  assert(brd_rtc::repair_sunday_weekday_if_valid(mock, 0x51));
+  assert(mock.registers[0x06] == 0);
+
+  printf("  -> Passed BCD and RTC calendar checks.\n");
+}
+
+static void test_rtc_arm_wake_protocol() {
+  printf("[TEST] brd_rtc arm_wake protocol, validation, and readback checks...\n");
+
+  MockI2cBus mock;
+
+  // Check arm_wake rejects invalid alarm hour (>= 24) and minute (>= 60).
+  brd_rtc::WakeSettings bad_alarm;
+  bad_alarm.use_alarm = true;
+  bad_alarm.target_utc_hour = 24;
+  bad_alarm.target_utc_minute = 0;
+  assert(!brd_rtc::arm_wake(mock, 0x51, bad_alarm));
+  bad_alarm.target_utc_hour = 23;
+  bad_alarm.target_utc_minute = 60;
+  assert(!brd_rtc::arm_wake(mock, 0x51, bad_alarm));
+  bad_alarm.target_utc_hour = 255;
+  bad_alarm.target_utc_minute = 255;
+  assert(!brd_rtc::arm_wake(mock, 0x51, bad_alarm));
+
+  // Check arm_wake in alarm mode.
   brd_rtc::WakeSettings ws_alarm;
   ws_alarm.use_alarm = true;
   ws_alarm.target_utc_hour = 5;
@@ -585,29 +887,170 @@ static void test_rtc_bcd_and_retries() {
   assert(mock.registers[0x0B] == 0x80);
   assert(mock.registers[0x0C] == 0x80);
 
-  // Test arm_wake readback mismatch returning false.
+  // Check alarm readback allows unused bit 6 (0x40) on 0x0A.
+  mock.clear_read_overrides();
+  mock.override_read[0x0A] = true;
+  mock.override_val[0x0A] = static_cast<uint8_t>(0x40U | brd_rtc::dec_to_bcd(5));
+  assert(brd_rtc::arm_wake(mock, 0x51, ws_alarm));
+
+  // Check alarm readback rejects AE bit (0x80) set on 0x09 or 0x0A and disarms RTC.
+  mock.clear_read_overrides();
+  mock.override_read[0x09] = true;
+  mock.override_val[0x09] = static_cast<uint8_t>(0x80 | brd_rtc::dec_to_bcd(20));
+  assert(!brd_rtc::arm_wake(mock, 0x51, ws_alarm));
+  assert(mock.registers[0x0E] == 0x00 && mock.registers[0x01] == 0x00);
+  mock.clear_read_overrides();
+  mock.override_read[0x0A] = true;
+  mock.override_val[0x0A] = static_cast<uint8_t>(0x80 | brd_rtc::dec_to_bcd(5));
+  assert(!brd_rtc::arm_wake(mock, 0x51, ws_alarm));
+  assert(mock.registers[0x0E] == 0x00 && mock.registers[0x01] == 0x00);
+  mock.override_val[0x0A] = static_cast<uint8_t>(0xC0U | brd_rtc::dec_to_bcd(5));
+  assert(!brd_rtc::arm_wake(mock, 0x51, ws_alarm));
+  assert(mock.registers[0x0E] == 0x00 && mock.registers[0x01] == 0x00);
+
+  // Check alarm readback rejects cleared AE bit (bit 7 == 0) on 0x0B or 0x0C and disarms RTC.
+  mock.clear_read_overrides();
+  mock.override_read[0x0B] = true;
+  mock.override_val[0x0B] = 0x00;
+  assert(!brd_rtc::arm_wake(mock, 0x51, ws_alarm));
+  assert(mock.registers[0x0E] == 0x00 && mock.registers[0x01] == 0x00);
+  mock.clear_read_overrides();
+  mock.override_read[0x0C] = true;
+  mock.override_val[0x0C] = 0x00;
+  assert(!brd_rtc::arm_wake(mock, 0x51, ws_alarm));
+  assert(mock.registers[0x0E] == 0x00 && mock.registers[0x01] == 0x00);
+
+  // Check alarm readback rejects AF or TF latched in register 0x01 and disarms RTC.
+  mock.clear_read_overrides();
+  mock.override_read[0x01] = true;
+  mock.override_val[0x01] = 0x0A;  // AIE | AF
+  assert(!brd_rtc::arm_wake(mock, 0x51, ws_alarm));
+  assert(mock.registers[0x0E] == 0x00 && mock.registers[0x01] == 0x00);
+  mock.clear_read_overrides();
+
+  // Check arm_wake readback mismatch disarms RTC and returns false.
   mock.inject_readback_mismatch = true;
   assert(!brd_rtc::arm_wake(mock, 0x51, ws_alarm));
+  assert(mock.registers[0x0E] == 0x00 && mock.registers[0x01] == 0x00);
   mock.inject_readback_mismatch = false;
 
-  // Test arm_wake in timer mode (<= 255s -> 1 Hz mode 0x82).
-  brd_rtc::WakeSettings ws_timer_sec;
-  ws_timer_sec.use_alarm = false;
-  ws_timer_sec.sleep_seconds = 120;
-  assert(brd_rtc::arm_wake(mock, 0x51, ws_timer_sec));
-  assert((mock.registers[0x01] & 0x01) != 0);
-  assert(mock.registers[0x0E] == 0x82);
-  assert(mock.registers[0x0F] == 120);
+  // Check alarm readback I2C failure disarms RTC before returning false.
+  mock.fail_read_count = 3;
+  assert(!brd_rtc::arm_wake(mock, 0x51, ws_alarm));
+  assert(mock.registers[0x0E] == 0x00 && mock.registers[0x01] == 0x00);
+  mock.fail_read_count = 0;
 
-  // Test arm_wake in timer mode (> 255s -> 1/60 Hz mode 0x83).
-  // Sleep duration of 898 seconds rounds to 15 minutes: (898 + 30) / 60 = 15.
-  brd_rtc::WakeSettings ws_timer_min;
-  ws_timer_min.use_alarm = false;
-  ws_timer_min.sleep_seconds = 898;
-  assert(brd_rtc::arm_wake(mock, 0x51, ws_timer_min));
-  assert((mock.registers[0x01] & 0x01) != 0);
-  assert(mock.registers[0x0E] == 0x83);
-  assert(mock.registers[0x0F] == 15);
+  // Check arm_wake in timer mode across boundary sleep_seconds values.
+  struct TimerCase {
+    uint32_t sleep_seconds;
+    uint8_t expected_ctrl;
+    uint8_t expected_val;
+  };
+  constexpr TimerCase TIMER_CASES[] = {
+      {0U, 0x82, 1},
+      {120U, 0x82, 120},
+      {255U, 0x82, 255},
+      {256U, 0x83, 4},
+      {898U, 0x83, 15},
+      {15300U, 0x83, 255},
+      {std::numeric_limits<uint32_t>::max(), 0x83, 255},
+  };
+  for (const auto &tc : TIMER_CASES) {
+    mock.history.clear();
+    brd_rtc::WakeSettings ws_timer;
+    ws_timer.use_alarm = false;
+    ws_timer.sleep_seconds = tc.sleep_seconds;
+    assert(brd_rtc::arm_wake(mock, 0x51, ws_timer));
+    assert(mock.registers[0x01] == 0x01);
+    assert(mock.registers[0x0E] == tc.expected_ctrl);
+    assert(mock.registers[0x0F] == tc.expected_val);
+    assert(mock.registers[0x09] == 0x80 && mock.registers[0x0A] == 0x80);
+    assert(mock.registers[0x0B] == 0x80 && mock.registers[0x0C] == 0x80);
+
+    // Check timer sequence: prep 0x0E -> write 0x0F -> read 0x0F -> write 0x01 -> start 0x0E -> read 0x0E -> read 0x01.
+    int idx_prep = -1;
+    int idx_val = -1;
+    int idx_rb_0f = -1;
+    int idx_tie = -1;
+    int idx_start = -1;
+    int idx_rb_0e = -1;
+    int idx_rb_01 = -1;
+    for (size_t i = 0; i < mock.history.size(); ++i) {
+      const auto &op = mock.history[i];
+      if (op.is_read) {
+        if (op.write_data.size() == 1 && op.write_data[0] == 0x0F) {
+          idx_rb_0f = static_cast<int>(i);
+        } else if (op.write_data.size() == 1 && op.write_data[0] == 0x0E) {
+          idx_rb_0e = static_cast<int>(i);
+        } else if (op.write_data.size() == 1 && op.write_data[0] == 0x01) {
+          idx_rb_01 = static_cast<int>(i);
+        }
+        continue;
+      }
+      if (op.write_data.size() < 2) {
+        continue;
+      }
+      if (op.write_data[0] == 0x0E && op.write_data[1] == (tc.expected_ctrl & 0x7FU)) {
+        idx_prep = static_cast<int>(i);
+      } else if (op.write_data[0] == 0x0F && op.write_data[1] == tc.expected_val) {
+        idx_val = static_cast<int>(i);
+      } else if (op.write_data[0] == 0x01 && op.write_data[1] == 0x01) {
+        idx_tie = static_cast<int>(i);
+      } else if (op.write_data[0] == 0x0E && op.write_data[1] == tc.expected_ctrl) {
+        idx_start = static_cast<int>(i);
+      }
+    }
+    assert(idx_prep >= 0 && idx_val > idx_prep && idx_rb_0f > idx_val && idx_tie > idx_rb_0f &&
+           idx_start > idx_tie && idx_rb_0e > idx_start && idx_rb_01 > idx_rb_0e);
+  }
+
+  // Check timer arm succeeds even if 0x0F decrements immediately when TE becomes 1.
+  brd_rtc::WakeSettings ws_timer_check;
+  ws_timer_check.use_alarm = false;
+  ws_timer_check.sleep_seconds = 900;
+  mock.clear_read_overrides();
+  mock.decrement_timer_on_start = true;
+  assert(brd_rtc::arm_wake(mock, 0x51, ws_timer_check));
+  assert(mock.registers[0x0F] == 14U);
+  mock.decrement_timer_on_start = false;
+
+  // Check timer readback allows unused bits 6 through 2 (0x7C) on 0x0E.
+  mock.clear_read_overrides();
+  mock.override_read[0x0E] = true;
+  mock.override_val[0x0E] = static_cast<uint8_t>(0x7CU | 0x83U);
+  assert(brd_rtc::arm_wake(mock, 0x51, ws_timer_check));
+
+  // Check timer readback rejects 0x0E mismatch, 0x0F mismatch, AF set, and TF set and disarms RTC.
+  mock.clear_read_overrides();
+  mock.override_read[0x0E] = true;
+  mock.override_val[0x0E] = static_cast<uint8_t>(0x7CU | 0x82U);  // Wrong frequency bits
+  assert(!brd_rtc::arm_wake(mock, 0x51, ws_timer_check));
+  assert(mock.registers[0x0E] == 0x00 && mock.registers[0x01] == 0x00);
+
+  mock.clear_read_overrides();
+  mock.override_read[0x0F] = true;
+  mock.override_val[0x0F] = 14;  // Wrong countdown value
+  assert(!brd_rtc::arm_wake(mock, 0x51, ws_timer_check));
+  assert(mock.registers[0x0E] == 0x00 && mock.registers[0x01] == 0x00);
+
+  mock.clear_read_overrides();
+  mock.override_read[0x01] = true;
+  mock.override_val[0x01] = 0x09;  // TIE | AF
+  assert(!brd_rtc::arm_wake(mock, 0x51, ws_timer_check));
+  assert(mock.registers[0x0E] == 0x00 && mock.registers[0x01] == 0x00);
+
+  mock.clear_read_overrides();
+  mock.override_read[0x01] = true;
+  mock.override_val[0x01] = 0x05;  // TIE | TF
+  assert(!brd_rtc::arm_wake(mock, 0x51, ws_timer_check));
+  assert(mock.registers[0x0E] == 0x00 && mock.registers[0x01] == 0x00);
+  mock.clear_read_overrides();
+
+  // Check timer readback I2C failure disarms RTC before returning false.
+  mock.fail_read_count = 3;
+  assert(!brd_rtc::arm_wake(mock, 0x51, ws_timer_check));
+  assert(mock.registers[0x0E] == 0x00 && mock.registers[0x01] == 0x00);
+  mock.fail_read_count = 0;
 
   printf("  -> Passed BCD and RTC driver checks.\n");
 }
@@ -630,6 +1073,10 @@ static void test_power_state_and_telemetry() {
   assert(brd_power::battery_voltage_to_percent(std::numeric_limits<float>::quiet_NaN()) == 0.0f);
   assert(brd_power::battery_voltage_to_percent(std::numeric_limits<float>::infinity()) == 0.0f);
   assert(brd_power::battery_voltage_to_percent(-std::numeric_limits<float>::infinity()) == 0.0f);
+  assert(brd_power::battery_voltage_to_percent(3.70f, 3.70f, 3.70f) == 0.0f);
+  assert(brd_power::battery_voltage_to_percent(3.70f, 4.20f, 3.00f) == 0.0f);
+  assert(brd_power::battery_voltage_to_percent(3.70f, std::numeric_limits<float>::quiet_NaN(), 4.20f) == 0.0f);
+  assert(brd_power::battery_voltage_to_percent(3.70f, 3.00f, std::numeric_limits<float>::quiet_NaN()) == 0.0f);
 
   // Clamping below minimum discharge threshold.
   assert(brd_power::battery_voltage_to_percent(-1.00f) == 0.0f);
@@ -701,7 +1148,30 @@ static void test_power_state_and_telemetry() {
   assert(!brd_power::is_valid_touch_point(10, 10, -540, 960));
   assert(!brd_power::is_valid_touch_point(10, 10, 540, -960));
 
-  // RtcPersistentState CRC validation and reset.
+  printf("  -> Passed battery curve and touch bounds checks.\n");
+}
+
+static void test_power_state_and_usb() {
+  printf("[TEST] brd_power RTC state CRC, sleep locks, and USB hysteresis...\n");
+
+  // RtcPersistentState CRC validation, version check, and padding determinism.
+  brd_power::RtcPersistentState state_aa;
+  brd_power::RtcPersistentState state_55;
+  std::memset(static_cast<void *>(&state_aa), 0xAA, sizeof(state_aa));
+  std::memset(static_cast<void *>(&state_55), 0x55, sizeof(state_55));
+  state_aa.reset();
+  state_55.reset();
+  assert(std::memcmp(&state_aa, &state_55, sizeof(state_aa)) == 0);
+  assert(state_aa.crc32 == state_55.crc32);
+  assert(state_aa.version == brd_power::RTC_STATE_VERSION);
+  assert(state_aa.validate_or_reset());
+
+  // Version mismatch triggers reset even with matching CRC.
+  state_aa.version = static_cast<uint16_t>(brd_power::RTC_STATE_VERSION + 1U);
+  state_aa.update_crc();
+  assert(!state_aa.validate_or_reset());
+  assert(state_aa.version == brd_power::RTC_STATE_VERSION);
+
   brd_power::RtcPersistentState state;
   state.reset();
   assert(state.validate_or_reset());
@@ -768,9 +1238,17 @@ static void test_power_state_and_telemetry() {
   assert(brd_power::evaluate_usb_power(4185, 4200, true, false, false));
   assert(!brd_power::evaluate_usb_power(4184, 4200, true, false, false));
 
-  // 3. Voltage rise >= 25 mV returns true.
+  // 3. Voltage rise >= 25 mV returns true without uint32_t addition overflow.
   assert(brd_power::evaluate_usb_power(4175, 4150, false, false, false));
   assert(!brd_power::evaluate_usb_power(4174, 4150, false, false, false));
+  assert(!brd_power::evaluate_usb_power(100U, std::numeric_limits<uint32_t>::max() - 10U, false,
+                                        false, false));
+  assert(brd_power::evaluate_usb_power(std::numeric_limits<uint32_t>::max(),
+                                       std::numeric_limits<uint32_t>::max() - 25U, false, false,
+                                       false));
+  assert(!brd_power::evaluate_usb_power(std::numeric_limits<uint32_t>::max(),
+                                        std::numeric_limits<uint32_t>::max() - 24U, false, false,
+                                        false));
 
   // 4. Cold boot with voltage >= 4195 mV returns true.
   assert(brd_power::evaluate_usb_power(4195, 0, false, false, false));
@@ -831,6 +1309,14 @@ static void test_power_state_and_telemetry() {
   assert(brd_power::compute_rtc_sync_age(1795499999U, 1795500000U) == -1);
   assert(brd_power::compute_rtc_sync_age(1795500000U, 1795500000U) == 0);
   assert(brd_power::compute_rtc_sync_age(1795500900U, 1795500000U) == 900);
+  // Large 32-bit epoch difference stays positive in int64_t.
+  assert(brd_power::compute_rtc_sync_age(4000000000U, 1000000000U) == 3000000000LL);
+
+  printf("  -> Passed power state and USB checks.\n");
+}
+
+static void test_power_telemetry() {
+  printf("[TEST] brd_power vlogs and Prometheus telemetry formatters...\n");
 
   // Telemetry formatters.
   brd_power::TraceTelemetry telem;
@@ -859,30 +1345,60 @@ static void test_power_state_and_telemetry() {
   int vlen = brd_power::format_vlogs_message(vlogs_msg, sizeof(vlogs_msg), telem);
   assert(vlen > 0 && static_cast<size_t>(vlen) < sizeof(vlogs_msg));
   assert(std::strstr(vlogs_msg, "wake=Ext_RTC mode=timer batt=4.12V batt_pct=92% awake=2.4s image=new touch=none") != nullptr);
+  assert(std::strstr(vlogs_msg, "next_in=900s since=900s") != nullptr);
   assert(std::strstr(vlogs_msg, "prev_gt911=0x5D boots=15 rtc_sync=synced rtc_sync_age=0s") != nullptr);
 
   char vmetrics_prom[448];
   int plen = brd_power::format_vmetrics_prometheus(vmetrics_prom, sizeof(vmetrics_prom), telem);
   assert(plen > 0 && static_cast<size_t>(plen) < sizeof(vmetrics_prom));
-  assert(std::strstr(vmetrics_prom, "battery_voltage{job=\"brd\"} 4.12") != nullptr);
-  assert(std::strstr(vmetrics_prom, "battery_percent{job=\"brd\"} 92") != nullptr);
-  assert(std::strstr(vmetrics_prom, "gt911_slept{job=\"brd\"} 1") != nullptr);
-  assert(std::strstr(vmetrics_prom, "boot_count{job=\"brd\"} 15") != nullptr);
-  assert(std::strstr(vmetrics_prom, "rtc_synced{job=\"brd\"} 1") != nullptr);
-  assert(std::strstr(vmetrics_prom, "rtc_sync_age_secs{job=\"brd\"} 0") != nullptr);
+  assert(vmetrics_prom[plen - 1] == '\n');
+  assert(std::strstr(vmetrics_prom, "battery_voltage{job=\"brd\"} 4.12\n") != nullptr);
+  assert(std::strstr(vmetrics_prom, "battery_percent{job=\"brd\"} 92\n") != nullptr);
+  assert(std::strstr(vmetrics_prom, "gt911_slept{job=\"brd\"} 1\n") != nullptr);
+  assert(std::strstr(vmetrics_prom, "boot_count{job=\"brd\"} 15\n") != nullptr);
+  assert(std::strstr(vmetrics_prom, "rtc_synced{job=\"brd\"} 1\n") != nullptr);
+  assert(std::strstr(vmetrics_prom, "rtc_sync_age_secs{job=\"brd\"} 0\n") != nullptr);
 
-  // Telemetry formatting when RTC sync timed out and age is unknown.
+  // Telemetry formatting when RTC sync exceeded the timeout and next_in/since are unknown (no "unknowns").
+  telem.next_in_str = "unknown";
+  telem.since_str = "unknown";
   telem.rtc_sync = "timeout";
   telem.rtc_sync_code = -1;
   telem.rtc_sync_age_sec = -1;
   vlen = brd_power::format_vlogs_message(vlogs_msg, sizeof(vlogs_msg), telem);
   assert(vlen > 0 && static_cast<size_t>(vlen) < sizeof(vlogs_msg));
+  assert(std::strstr(vlogs_msg, "next_in=unknown since=unknown") != nullptr);
+  assert(std::strstr(vlogs_msg, "unknowns") == nullptr);
   assert(std::strstr(vlogs_msg, "rtc_sync=timeout rtc_sync_age=unknown") != nullptr);
+
+  // Negative numeric next_in values receive the 's' suffix. Null fields return "unknown" without an extra 's'.
+  brd_power::TraceTelemetry null_telem;
+  null_telem.wake_reason = nullptr;
+  null_telem.mode = nullptr;
+  null_telem.image_status = nullptr;
+  null_telem.now_str = nullptr;
+  null_telem.next_str = nullptr;
+  null_telem.next_in_str = nullptr;
+  null_telem.since_str = nullptr;
+  null_telem.job_name = nullptr;
+  null_telem.rtc_sync = nullptr;
+  vlen = brd_power::format_vlogs_message(vlogs_msg, sizeof(vlogs_msg), null_telem);
+  assert(vlen > 0 && static_cast<size_t>(vlen) < sizeof(vlogs_msg));
+  assert(std::strstr(vlogs_msg, "next_in=unknown since=unknown") != nullptr);
+  assert(std::strstr(vlogs_msg, "unknowns") == nullptr);
+
+  null_telem.next_in_str = "-15";
+  null_telem.since_str = "0";
+  vlen = brd_power::format_vlogs_message(vlogs_msg, sizeof(vlogs_msg), null_telem);
+  assert(vlen > 0 && static_cast<size_t>(vlen) < sizeof(vlogs_msg));
+  assert(std::strstr(vlogs_msg, "next_in=-15s since=0s") != nullptr);
+
   char vmetrics_prom_large[640];
   plen = brd_power::format_vmetrics_prometheus(vmetrics_prom_large, sizeof(vmetrics_prom_large), telem);
   assert(plen > 0 && static_cast<size_t>(plen) < sizeof(vmetrics_prom_large));
-  assert(std::strstr(vmetrics_prom_large, "rtc_synced{job=\"brd\"} -1") != nullptr);
-  assert(std::strstr(vmetrics_prom_large, "rtc_sync_age_secs{job=\"brd\"} -1") != nullptr);
+  assert(vmetrics_prom_large[plen - 1] == '\n');
+  assert(std::strstr(vmetrics_prom_large, "rtc_synced{job=\"brd\"} -1\n") != nullptr);
+  assert(std::strstr(vmetrics_prom_large, "rtc_sync_age_secs{job=\"brd\"} -1\n") != nullptr);
 
   // Prometheus label escaping and NaN battery handling.
   char escaped_label[32];
@@ -899,10 +1415,28 @@ static void test_power_state_and_telemetry() {
   assert(std::strstr(vlogs_msg, "batt=unknown batt_pct=unknown awake=0.0s") != nullptr);
   plen = brd_power::format_vmetrics_prometheus(vmetrics_prom_large, sizeof(vmetrics_prom_large), nan_telem);
   assert(plen > 0 && static_cast<size_t>(plen) < sizeof(vmetrics_prom_large));
+  assert(vmetrics_prom_large[plen - 1] == '\n');
   assert(std::strstr(vmetrics_prom_large, "battery_voltage") == nullptr);
   assert(std::strstr(vmetrics_prom_large, "battery_percent") == nullptr);
   assert(std::strstr(vmetrics_prom_large, "nan") == nullptr);
-  assert(std::strstr(vmetrics_prom_large, "wake_secs{job=\"kitchen-epaper-display-west-01\\\"x\"} 0.0") != nullptr);
+  assert(std::strstr(vmetrics_prom_large, "wake_secs{job=\"kitchen-epaper-display-west-01\\\"x\"} 0.0\n") != nullptr);
+
+  // Prometheus batt_lines truncation resets NUL cleanly instead of emitting a partial metric.
+  brd_power::TraceTelemetry long_job_telem = telem;
+  const std::string long_job(95, 'j');
+  long_job_telem.job_name = long_job.c_str();
+  long_job_telem.batt_v = 123456.78f;
+  long_job_telem.batt_pct = 1234567890.0f;
+  char vmetrics_prom_huge[2048];
+  plen = brd_power::format_vmetrics_prometheus(vmetrics_prom_huge, sizeof(vmetrics_prom_huge),
+                                               long_job_telem);
+  assert(plen > 0 && static_cast<size_t>(plen) < sizeof(vmetrics_prom_huge));
+  assert(vmetrics_prom_huge[plen - 1] == '\n');
+  assert(std::strstr(vmetrics_prom_huge, "battery_voltage{job=\"") != nullptr);
+  assert(std::strstr(vmetrics_prom_huge, "battery_percent") == nullptr);
+  const char *wake_pos = std::strstr(vmetrics_prom_huge, "wake_secs{job=\"");
+  assert(wake_pos != nullptr);
+  assert(wake_pos > vmetrics_prom_huge && wake_pos[-1] == '\n');
 
   printf("  -> Passed power state and telemetry checks.\n");
 }
@@ -917,14 +1451,16 @@ static void test_multithreaded_concurrency() {
     std::vector<uint8_t> data(brd_blit::FRAMEBUFFER_SIZE);
     for (int i = 0; i < ITERATIONS; ++i) {
       std::memset(data.data(), static_cast<uint8_t>(i & 0xFF), data.size());
-      shared_buffer.store(data.data(), data.size());
+      assert(shared_buffer.store(data.data(), data.size()));
     }
   });
 
   std::thread t2([&shared_buffer]() {
     std::vector<uint8_t> data(brd_blit::FRAMEBUFFER_SIZE);
     for (int i = 0; i < ITERATIONS; ++i) {
-      shared_buffer.retrieve(data.data(), data.size());
+      if (shared_buffer.retrieve(data.data(), data.size())) {
+        assert(std::memcmp(data.data(), data.data() + 1, data.size() - 1) == 0);
+      }
     }
   });
 
@@ -992,8 +1528,12 @@ int main() {
   test_blit_thread_safe_buffer();
   test_schedule_civil_normalization();
   test_schedule_dst_and_boundaries();
+  test_schedule_dst_edge_cases();
   test_rtc_bcd_and_retries();
+  test_rtc_arm_wake_protocol();
   test_power_state_and_telemetry();
+  test_power_state_and_usb();
+  test_power_telemetry();
   test_multithreaded_concurrency();
 
   printf("=========================================\n");

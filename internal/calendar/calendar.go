@@ -26,12 +26,14 @@ import (
 )
 
 const (
-	oauthStateBytes      = 32
-	oauthStateTTL        = 10 * time.Minute
-	maxPendingStates     = 256
-	oauthStateCookieName = "brd_oauth_state"
-	fetchTimeout         = 15 * time.Second
-	maxEventPages        = 20
+	oauthStateBytes        = 32
+	oauthStateTTL          = 10 * time.Minute
+	maxPendingStates       = 256
+	oauthStateCookieName   = "brd_oauth_state"
+	fetchTimeout           = 15 * time.Second
+	tomorrowFetchTimeout   = 5 * time.Second
+	defaultRefreshInterval = 5 * time.Minute
+	maxEventPages          = 20
 )
 
 type pendingOAuthState struct {
@@ -68,10 +70,11 @@ func (g *googleEventFetcher) ListEvents(ctx context.Context, calID, timeMin, tim
 		}
 		items = append(items, resp.Items...)
 		if resp.NextPageToken == "" {
-			break
+			return items, nil
 		}
 		pageToken = resp.NextPageToken
 	}
+	log.Printf("Warning: calendar %s reached page limit %d and truncated results", calID, maxEventPages)
 	return items, nil
 }
 
@@ -86,7 +89,7 @@ type Options struct {
 	Fetcher          EventFetcher
 }
 
-// Service manages Google Calendar OAuth2 state and renders daily event HTML.
+// Service manages Google Calendar OAuth state and renders daily event HTML.
 type Service struct {
 	calendars        []string
 	loc              *time.Location
@@ -94,6 +97,7 @@ type Service struct {
 	refreshTokenFile string
 	clientSecretFile string
 	nowFn            func() time.Time
+	refreshInterval  time.Duration
 
 	mu            sync.RWMutex
 	config        *oauth2.Config
@@ -112,7 +116,7 @@ type Service struct {
 	pendingStates map[string]pendingOAuthState
 }
 
-// NewService creates a calendar Service and attempts initial OAuth setup when no custom Fetcher is provided.
+// NewService creates a calendar Service and initializes OAuth when opts.Fetcher is nil.
 func NewService(ctx context.Context, opts Options) (*Service, error) {
 	loc := opts.Location
 	if loc == nil {
@@ -132,6 +136,7 @@ func NewService(ctx context.Context, opts Options) (*Service, error) {
 		refreshTokenFile: opts.RefreshTokenFile,
 		clientSecretFile: opts.ClientSecretFile,
 		nowFn:            nowFn,
+		refreshInterval:  defaultRefreshInterval,
 		fetcher:          opts.Fetcher,
 		pendingStates:    make(map[string]pendingOAuthState),
 	}
@@ -142,11 +147,13 @@ func NewService(ctx context.Context, opts Options) (*Service, error) {
 	return s, s.init(ctx)
 }
 
-// Close stops the background OAuth token refresh loop and waits for it to exit.
+// Close stops the refresh loop for OAuth tokens and waits for it to exit.
 func (s *Service) Close() {
 	if s == nil {
 		return
 	}
+	s.setupMu.Lock()
+	defer s.setupMu.Unlock()
 	s.stopRefreshLoop()
 }
 
@@ -165,7 +172,8 @@ func (s *Service) stopRefreshLoop() {
 	}
 }
 
-// TokenExpiry returns the cached OAuth access token expiry formatted as RFC3339, or empty if unavailable.
+// TokenExpiry returns the expiry of the cached OAuth token in RFC3339 format.
+// It returns an empty string when no expiry is available.
 func (s *Service) TokenExpiry() string {
 	if s == nil {
 		return ""
@@ -183,33 +191,54 @@ func oauthHTTPContext(parent context.Context) context.Context {
 	return context.WithValue(parent, oauth2.HTTPClient, &http.Client{Timeout: fetchTimeout})
 }
 
-func (s *Service) init(ctx context.Context) error {
-	if s.clientSecretFile == "" {
-		err := errors.New("client secret path is empty")
-		s.recordSetupError(err)
-		return err
+func isHTTPSRequest(r *http.Request) bool {
+	return r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
+}
+
+func (s *Service) loadOAuthConfig() (*oauth2.Config, error) {
+	s.setupMu.Lock()
+	defer s.setupMu.Unlock()
+	return s.loadOAuthConfigLocked()
+}
+
+func (s *Service) loadOAuthConfigLocked() (*oauth2.Config, error) {
+	s.mu.RLock()
+	cfg := s.config
+	s.mu.RUnlock()
+	if cfg != nil {
+		return cfg, nil
+	}
+
+	if strings.TrimSpace(s.clientSecretFile) == "" {
+		return nil, errors.New("client secret path is empty")
 	}
 	warnInsecureFilePerms(s.clientSecretFile)
 	b, err := os.ReadFile(s.clientSecretFile)
 	if err != nil {
-		wrapErr := fmt.Errorf("read client secret file: %w", err)
-		s.recordSetupError(wrapErr)
-		return wrapErr
+		return nil, fmt.Errorf("read client secret file: %w", err)
 	}
 
-	cfg, err := google.ConfigFromJSON(b, gcal.CalendarReadonlyScope)
+	cfg, err = google.ConfigFromJSON(b, gcal.CalendarReadonlyScope)
 	if err != nil {
-		wrapErr := fmt.Errorf("parse client secret JSON: %w", err)
-		s.recordSetupError(wrapErr)
-		return wrapErr
+		return nil, fmt.Errorf("parse client secret JSON: %w", err)
 	}
 
 	s.mu.Lock()
 	s.config = cfg
 	s.mu.Unlock()
+	return cfg, nil
+}
 
-	if err := s.setupService(ctx); err != nil {
-		return fmt.Errorf("setup calendar service: %w", err)
+func (s *Service) init(ctx context.Context) error {
+	s.setupMu.Lock()
+	defer s.setupMu.Unlock()
+
+	if _, err := s.loadOAuthConfigLocked(); err != nil {
+		s.recordSetupError(err)
+		return err
+	}
+	if err := s.setupServiceLocked(ctx, nil); err != nil {
+		return fmt.Errorf("initialize calendar service: %w", err)
 	}
 	return nil
 }
@@ -217,54 +246,68 @@ func (s *Service) init(ctx context.Context) error {
 func (s *Service) setupService(ctx context.Context) error {
 	s.setupMu.Lock()
 	defer s.setupMu.Unlock()
+	return s.setupServiceLocked(ctx, nil)
+}
 
+func (s *Service) setupServiceLocked(ctx context.Context, providedTok *oauth2.Token) error {
 	s.mu.RLock()
 	cfg := s.config
 	s.mu.RUnlock()
 
 	if cfg == nil {
-		err := errors.New("oauth2 config is nil")
+		err := errors.New("oauth config is nil")
 		s.recordSetupError(err)
 		return err
 	}
 
-	s.tokenFileMu.Lock()
-	warnInsecureFilePerms(s.tokenFile)
-	tok, err := readTokenFile(s.tokenFile)
-	s.tokenFileMu.Unlock()
-	if err != nil {
-		wrapErr := fmt.Errorf("invalid token file, visit /newtoken: %w", err)
-		s.recordSetupError(wrapErr)
-		return wrapErr
+	tok := providedTok
+	if tok == nil {
+		s.tokenFileMu.Lock()
+		warnInsecureFilePerms(s.tokenFile)
+		var err error
+		tok, err = readTokenFile(s.tokenFile)
+		s.tokenFileMu.Unlock()
+		if err != nil {
+			wrapErr := fmt.Errorf("invalid token file, visit /newtoken: %w", err)
+			s.recordSetupError(wrapErr)
+			return wrapErr
+		}
 	}
 
 	initCtx, cancel := context.WithTimeout(ctx, fetchTimeout)
 	defer cancel()
 	initOAuthCtx := oauthHTTPContext(initCtx)
 
-	// Refresh and verify the token outside s.mu with a bounded timeout and HTTP client.
+	// Refresh and validate the token outside s.mu with a bounded timeout.
 	initTokSrc := cfg.TokenSource(initOAuthCtx, tok)
 	liveTok, err := initTokSrc.Token()
 	if err != nil {
-		wrapErr := fmt.Errorf("obtain oauth token: %w", err)
+		wrapErr := fmt.Errorf("fetch oauth token: %w", err)
 		s.recordSetupError(wrapErr)
 		return wrapErr
 	}
 	if !liveTok.Valid() {
-		expErr := errors.New("token expired and failed renewal, visit /newtoken")
+		expErr := errors.New("token expired and failed refresh, visit /newtoken")
 		s.recordSetupError(expErr)
 		return expErr
 	}
+	if liveTok.RefreshToken == "" && tok.RefreshToken != "" {
+		liveTokCopy := *liveTok
+		liveTokCopy.RefreshToken = tok.RefreshToken
+		liveTok = &liveTokCopy
+	}
 
-	// Stop any previous refresh loop before writing token.json or installing the new TokenSource.
+	// Stop the prior refresh loop only after the new token validates.
 	s.stopRefreshLoop()
 
-	if liveTok.AccessToken != tok.AccessToken {
+	if liveTok.AccessToken != tok.AccessToken || providedTok != nil {
 		s.tokenFileMu.Lock()
-		saveErr := saveTokenAtomic(s.tokenFile, liveTok)
+		savedTok, saveErr := saveTokenAtomic(s.tokenFile, liveTok)
 		s.tokenFileMu.Unlock()
 		if saveErr != nil {
-			log.Printf("Failed to save renewed token on startup: %v", saveErr)
+			log.Printf("Save refreshed token failed: %v", saveErr)
+		} else {
+			liveTok = savedTok
 		}
 	}
 
@@ -310,7 +353,11 @@ func (s *Service) recordSetupError(err error) {
 }
 
 func (s *Service) refreshTokenLoop(ctx context.Context, tokSrc oauth2.TokenSource) {
-	ticker := time.NewTicker(5 * time.Minute)
+	interval := s.refreshInterval
+	if interval <= 0 {
+		interval = defaultRefreshInterval
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for {
@@ -344,7 +391,7 @@ func (s *Service) refreshTokenLoop(ctx context.Context, tokSrc oauth2.TokenSourc
 					s.tokenFileMu.Unlock()
 					return
 				}
-				saveErr := saveTokenAtomic(s.tokenFile, tok)
+				_, saveErr := saveTokenAtomic(s.tokenFile, tok)
 				s.tokenFileMu.Unlock()
 				if saveErr != nil {
 					log.Printf("Save refreshed token failed: %v", saveErr)
@@ -369,6 +416,10 @@ func (s *Service) refreshTokenLoop(ctx context.Context, tokSrc oauth2.TokenSourc
 
 // Events fetches, deduplicates, and sorts events for the day containing t.
 func (s *Service) Events(ctx context.Context, t time.Time) ([]*gcal.Event, error) {
+	if s == nil {
+		return nil, errors.New("calendar service is not initialized")
+	}
+
 	s.mu.RLock()
 	fetcher := s.fetcher
 	srvErr := s.srvErr
@@ -465,24 +516,39 @@ func (s *Service) RenderHTML(ctx context.Context, t time.Time) (string, error) {
 
 	events, err := s.Events(ctx, t)
 	if err != nil {
-		return "", fmt.Errorf("retrieve calendar events: %w", err)
+		return "", fmt.Errorf("fetch calendar events: %w", err)
 	}
 
 	now := s.nowFn()
 	var lines []string
+	todayRenderedIDs := make(map[string]struct{}, len(events))
 	for _, ev := range events {
 		if li := formatEventLi(ev, now, s.loc); li != "" {
 			lines = append(lines, li)
+			if ev.Id != "" {
+				todayRenderedIDs[ev.Id] = struct{}{}
+			}
 		}
 	}
 
 	if len(lines) < 4 {
-		tomorrowEvents, err := s.Events(ctx, t.AddDate(0, 0, 1))
+		// Anchor at local noon so DST fall-back days still advance to the next calendar date.
+		localDay := t.In(s.loc)
+		nextDay := time.Date(localDay.Year(), localDay.Month(), localDay.Day(), 12, 0, 0, 0, s.loc).AddDate(0, 0, 1)
+
+		tomorrowCtx, tomorrowCancel := context.WithTimeout(ctx, tomorrowFetchTimeout)
+		tomorrowEvents, err := s.Events(tomorrowCtx, nextDay)
+		tomorrowCancel()
 		if err != nil {
-			log.Printf("Retrieve tomorrow calendar events failed: %v", err)
+			log.Printf("Fetch tomorrow calendar events failed: %v", err)
 		} else {
 			var tomorrowLines []string
 			for _, ev := range tomorrowEvents {
+				if ev != nil && ev.Id != "" {
+					if _, dup := todayRenderedIDs[ev.Id]; dup {
+						continue
+					}
+				}
 				if li := formatEventLi(ev, now, s.loc); li != "" {
 					tomorrowLines = append(tomorrowLines, li)
 				}
@@ -504,28 +570,18 @@ func (s *Service) RenderHTML(ctx context.Context, t time.Time) (string, error) {
 	return fmt.Sprintf("<ul style=\"font-size:32px;margin-top:12px;margin-bottom:12px;\">\n%s\n</ul>\n", strings.Join(lines, "\n")), nil
 }
 
-// RedirectForToken starts the OAuth2 authorization flow with a random state token.
+// RedirectForToken starts the OAuth authorization flow with a random state token.
 func (s *Service) RedirectForToken(w http.ResponseWriter, r *http.Request) {
 	if s == nil {
 		http.Error(w, "Calendar service unavailable", http.StatusInternalServerError)
 		return
 	}
 
-	s.mu.RLock()
-	cfg := s.config
-	s.mu.RUnlock()
-
-	if cfg == nil {
-		if err := s.init(r.Context()); err != nil {
-			log.Printf("Calendar init failed during OAuth redirect: %v", err)
-		}
-		s.mu.RLock()
-		cfg = s.config
-		s.mu.RUnlock()
-		if cfg == nil {
-			http.Error(w, "Calendar configuration unavailable", http.StatusInternalServerError)
-			return
-		}
+	cfg, err := s.loadOAuthConfig()
+	if err != nil {
+		log.Printf("Load OAuth config failed during redirect: %v", err)
+		http.Error(w, "Calendar configuration unavailable", http.StatusInternalServerError)
+		return
 	}
 
 	state, verifier, err := s.issueStateWithVerifier()
@@ -535,7 +591,7 @@ func (s *Service) RedirectForToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	isHTTPS := r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
+	isHTTPS := isHTTPSRequest(r)
 	http.SetCookie(w, &http.Cookie{
 		Name:     oauthStateCookieName,
 		Value:    state,
@@ -549,13 +605,13 @@ func (s *Service) RedirectForToken(w http.ResponseWriter, r *http.Request) {
 	authURL := cfg.AuthCodeURL(
 		state,
 		oauth2.AccessTypeOffline,
-		oauth2.ApprovalForce,
+		oauth2.SetAuthURLParam("prompt", "consent"),
 		oauth2.S256ChallengeOption(verifier),
 	)
 	http.Redirect(w, r, authURL, http.StatusSeeOther)
 }
 
-// ProcessAuthCode validates the OAuth state token, exchanges the code, and persists the new token.
+// ProcessAuthCode validates the OAuth state token, exchanges the code, and saves the new token.
 func (s *Service) ProcessAuthCode(w http.ResponseWriter, r *http.Request) {
 	if s == nil {
 		http.Error(w, "Calendar service unavailable", http.StatusInternalServerError)
@@ -581,14 +637,23 @@ func (s *Service) ProcessAuthCode(w http.ResponseWriter, r *http.Request) {
 		Name:     oauthStateCookieName,
 		Value:    "",
 		Path:     "/savetoken",
+		Expires:  time.Unix(0, 0),
 		MaxAge:   -1,
 		HttpOnly: true,
+		Secure:   isHTTPSRequest(r),
 		SameSite: http.SameSiteLaxMode,
 	})
 
 	verifier, ok := s.consumeStateWithVerifier(state)
 	if !ok {
 		http.Error(w, "Invalid or expired OAuth state", http.StatusBadRequest)
+		return
+	}
+
+	if oauthErr := strings.TrimSpace(q.Get("error")); oauthErr != "" {
+		errDesc := strings.TrimSpace(q.Get("error_description"))
+		log.Printf("OAuth authorization failed: error=%q description=%q", oauthErr, errDesc)
+		http.Error(w, "Authorization failed", http.StatusBadRequest)
 		return
 	}
 
@@ -607,9 +672,11 @@ func (s *Service) ProcessAuthCode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.stopRefreshLoop()
+	s.setupMu.Lock()
+	defer s.setupMu.Unlock()
+
 	s.tokenFileMu.Lock()
-	saveErr := saveTokenAtomic(s.tokenFile, tok)
+	savedTok, saveErr := saveTokenAtomic(s.tokenFile, tok)
 	s.tokenFileMu.Unlock()
 	if saveErr != nil {
 		log.Printf("Save OAuth token failed: %v", saveErr)
@@ -617,12 +684,16 @@ func (s *Service) ProcessAuthCode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := touchFileAtomic(s.refreshTokenFile, s.nowFn()); err != nil {
-		log.Printf("Record refresh timestamp failed: %v", err)
+	if tok.RefreshToken != "" {
+		if err := touchFileAtomic(s.refreshTokenFile, s.nowFn()); err != nil {
+			log.Printf("Record refresh timestamp failed: %v", err)
+		}
+	} else {
+		log.Print("Warning: Google omitted a refresh token during authorization")
 	}
 
-	if err := s.setupService(r.Context()); err != nil {
-		log.Printf("Calendar service setup failed: %v", err)
+	if err := s.setupServiceLocked(r.Context(), savedTok); err != nil {
+		log.Printf("Initialize calendar service failed: %v", err)
 		http.Error(w, "Failed to initialize calendar service", http.StatusInternalServerError)
 		return
 	}
@@ -708,7 +779,7 @@ func sortEvents(events []*gcal.Event) {
 	sort.Slice(events, func(i, j int) bool {
 		a, b := events[i], events[j]
 
-		// Strict weak ordering for nil Start values: non-nil sorts before nil.
+		// Sort non-nil Start values before nil Start values.
 		if (a.Start == nil) != (b.Start == nil) {
 			return a.Start != nil
 		}
@@ -791,6 +862,9 @@ func formatEventLi(event *gcal.Event, now time.Time, loc *time.Location) string 
 		return ""
 	}
 	if event.End == nil || event.End.DateTime == "" {
+		if start.Before(now) {
+			return ""
+		}
 		return fmt.Sprintf("<li>%s: %s</li>", start.In(loc).Format("15:04"), escapedSummary)
 	}
 
@@ -812,7 +886,7 @@ func warnInsecureFilePerms(path string) {
 	}
 	perm := info.Mode().Perm()
 	if perm&0077 != 0 {
-		log.Printf("Warning: secret file %q has permissive mode %04o; expected 0600", path, perm)
+		log.Printf("Warning: secret file %q has mode %04o. Expected 0600", path, perm)
 	}
 }
 
@@ -829,7 +903,14 @@ func readTokenFile(path string) (*oauth2.Token, error) {
 	return tok, nil
 }
 
-func saveTokenAtomic(path string, token *oauth2.Token) error {
+func saveTokenAtomic(path string, token *oauth2.Token) (*oauth2.Token, error) {
+	if strings.TrimSpace(path) == "" {
+		return nil, errors.New("token file path is empty")
+	}
+	if token == nil {
+		return nil, errors.New("oauth token is nil")
+	}
+
 	tokCopy := *token
 	if tokCopy.RefreshToken == "" {
 		if existing, err := readTokenFile(path); err == nil && existing.RefreshToken != "" {
@@ -839,12 +920,18 @@ func saveTokenAtomic(path string, token *oauth2.Token) error {
 
 	data, err := json.Marshal(&tokCopy)
 	if err != nil {
-		return fmt.Errorf("marshal oauth token: %w", err)
+		return nil, fmt.Errorf("marshal oauth token: %w", err)
 	}
-	return atomicfile.Write(path, data, 0600)
+	if err := atomicfile.Write(path, data, 0600); err != nil {
+		return nil, err
+	}
+	return &tokCopy, nil
 }
 
 func touchFileAtomic(path string, ts time.Time) error {
+	if strings.TrimSpace(path) == "" {
+		return errors.New("marker file path is empty")
+	}
 	if err := atomicfile.Write(path, nil, 0600); err != nil {
 		return err
 	}

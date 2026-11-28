@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <type_traits>
 #include <utility>
 #include "brd_rtc.h"
 
@@ -17,16 +18,17 @@
 namespace brd_power {
 
 constexpr uint32_t RTC_STATE_MAGIC = 0x42524450;
+constexpr uint16_t RTC_STATE_VERSION = 1U;
 constexpr uint32_t RTC_SYNC_INTERVAL_SEC = 21600U;
 
-// Bit constants for the 74HCT4094D shift register.
+// Define bit masks for the 74HCT4094D shift register.
 // CFG_RAILS_ONLY_ON sets ep_scan_direction=1 and power_disable=1.
 // CFG_ALL_OFF_SMPS_DISABLED clears ep_scan_direction and sets power_disable=1.
 constexpr uint8_t CFG_RAILS_ONLY_ON = 0x22;
 constexpr uint8_t CFG_ALL_OFF_SMPS_DISABLED = 0x02;
 
-// Piecewise linear discharge curve for 1S lithium polymer cells.
-// The array matches the ten points from the battery driver table.
+// Define a piecewise linear discharge curve for 1S LiPo cells.
+// Each entry pairs a cell voltage with its matching percentage.
 static constexpr std::array<std::pair<float, float>, 10> VOLTAGE_CURVE = {{
     {4.20f, 100.0f},
     {4.10f, 92.0f},
@@ -42,7 +44,8 @@ static constexpr std::array<std::pair<float, float>, 10> VOLTAGE_CURVE = {{
 
 inline float battery_voltage_to_percent(float voltage, float min_voltage = 3.00f,
                                        float max_voltage = 4.20f) {
-  if (!std::isfinite(voltage)) {
+  if (!std::isfinite(voltage) || !std::isfinite(min_voltage) || !std::isfinite(max_voltage) ||
+      min_voltage >= max_voltage) {
     return 0.0f;
   }
   if (voltage >= max_voltage) {
@@ -78,15 +81,21 @@ inline bool is_valid_touch_point(int32_t x, int32_t y, int32_t width, int32_t he
 
 struct RtcPersistentState {
   uint32_t magic{RTC_STATE_MAGIC};
+  uint16_t version{RTC_STATE_VERSION};
+  uint8_t pad0_{0};
+  uint8_t pad1_{0};
   uint32_t boot_count{0};
   uint32_t prev_trace_epoch{0};
+  uint32_t last_rtc_sync_epoch{0};
+  uint32_t prev_batt_mv{0};
   bool prev_slept{false};
   int8_t prev_gt911{-1};
   int8_t last_gt911_addr{0};
-  uint32_t last_rtc_sync_epoch{0};
-  uint32_t prev_batt_mv{0};
   bool staying_awake_usb{false};
+  // Store the /img.sha digest only to detect image changes, not as a security check.
+  // The firmware does not calculate SHA-256 on the device to save CPU time and power.
   char last_img_hash[65]{};
+  uint8_t pad2_[3]{};
   uint32_t crc32{0};
 
   uint32_t calculate_crc() const {
@@ -96,7 +105,7 @@ struct RtcPersistentState {
     for (size_t i = 0; i < len; ++i) {
       crc ^= data[i];
       for (int b = 0; b < 8; ++b) {
-        crc = (crc >> 1) ^ (0xEDB88320U & (0 - (crc & 1)));
+        crc = (crc >> 1) ^ (0xEDB88320U & (0U - (crc & 1U)));
       }
     }
     return ~crc;
@@ -107,7 +116,8 @@ struct RtcPersistentState {
   }
 
   bool validate_or_reset() {
-    if (this->magic == RTC_STATE_MAGIC && this->crc32 == this->calculate_crc()) {
+    if (this->magic == RTC_STATE_MAGIC && this->version == RTC_STATE_VERSION &&
+        this->crc32 == this->calculate_crc()) {
       return true;
     }
     this->reset();
@@ -115,21 +125,31 @@ struct RtcPersistentState {
   }
 
   void reset() {
+    std::memset(static_cast<void *>(this), 0, sizeof(*this));
     this->magic = RTC_STATE_MAGIC;
-    this->boot_count = 0;
-    this->prev_trace_epoch = 0;
-    this->prev_slept = false;
+    this->version = RTC_STATE_VERSION;
     this->prev_gt911 = -1;
-    this->last_gt911_addr = 0;
-    this->last_rtc_sync_epoch = 0;
-    this->prev_batt_mv = 0;
-    this->staying_awake_usb = false;
-    for (size_t i = 0; i < sizeof(this->last_img_hash); ++i) {
-      this->last_img_hash[i] = '\0';
-    }
     this->update_crc();
   }
 };
+
+static_assert(std::is_trivially_copyable_v<RtcPersistentState>,
+              "RtcPersistentState must be trivially copyable.");
+static_assert(
+    offsetof(RtcPersistentState, crc32) ==
+        sizeof(RtcPersistentState::magic) + sizeof(RtcPersistentState::version) +
+            sizeof(RtcPersistentState::pad0_) + sizeof(RtcPersistentState::pad1_) +
+            sizeof(RtcPersistentState::boot_count) +
+            sizeof(RtcPersistentState::prev_trace_epoch) +
+            sizeof(RtcPersistentState::last_rtc_sync_epoch) +
+            sizeof(RtcPersistentState::prev_batt_mv) + sizeof(RtcPersistentState::prev_slept) +
+            sizeof(RtcPersistentState::prev_gt911) + sizeof(RtcPersistentState::last_gt911_addr) +
+            sizeof(RtcPersistentState::staying_awake_usb) +
+            sizeof(RtcPersistentState::last_img_hash) + sizeof(RtcPersistentState::pad2_),
+    "RtcPersistentState must not contain unnamed padding before crc32.");
+static_assert(sizeof(RtcPersistentState) ==
+                  offsetof(RtcPersistentState, crc32) + sizeof(RtcPersistentState::crc32),
+              "RtcPersistentState must not contain trailing padding.");
 
 inline RTC_DATA_ATTR RtcPersistentState rtc_state;
 
@@ -164,7 +184,7 @@ inline uint32_t voltage_to_mv(float v) {
 
 inline const char *classify_wake_reason(int wake_cause, uint64_t ext1_mask, bool rtc_af,
                                        bool rtc_tf) {
-  // Handle EXT1 wakeup triggers.
+  // Handle EXT1 wake triggers.
   if (wake_cause == 3) {
     if ((ext1_mask & (1ULL << 21)) != 0) {
       return "Ext_BTN";
@@ -178,12 +198,12 @@ inline const char *classify_wake_reason(int wake_cause, uint64_t ext1_mask, bool
     return "Ext_RTC";
   }
 
-  // Handle timer wakeup triggers.
+  // Handle timer wake triggers.
   if (wake_cause == 4) {
     return "Int_RTC";
   }
 
-  // Handle initial power activation.
+  // Handle power-on boot.
   if (wake_cause == 0) {
     return "Power_On";
   }
@@ -201,11 +221,11 @@ inline bool evaluate_usb_power(uint32_t current_mv, uint32_t prev_mv, bool curre
     return current_mv >= 4185U;
   }
 
-  if (prev_mv > 0 && current_mv >= prev_mv + 25U) {
+  if (prev_mv > 0U && current_mv >= prev_mv && (current_mv - prev_mv) >= 25U) {
     return true;
   }
 
-  if (prev_mv == 0 && !prev_slept && current_mv >= 4195U) {
+  if (prev_mv == 0U && !prev_slept && current_mv >= 4195U) {
     return true;
   }
 
@@ -240,11 +260,11 @@ inline int classify_rtc_sync_metric(bool sync_requested, bool ntp_synced, bool r
   return 0;
 }
 
-inline long compute_rtc_sync_age(uint32_t now_epoch, uint32_t last_sync_epoch) {
+inline int64_t compute_rtc_sync_age(uint32_t now_epoch, uint32_t last_sync_epoch) {
   if (now_epoch == 0U || last_sync_epoch == 0U || now_epoch < last_sync_epoch) {
     return -1;
   }
-  return static_cast<long>(now_epoch - last_sync_epoch);
+  return static_cast<int64_t>(now_epoch - last_sync_epoch);
 }
 
 struct TraceTelemetry {
@@ -264,11 +284,31 @@ struct TraceTelemetry {
   int prev_gt911{-1};
   uint32_t boot_count{0};
   const char *job_name{"brd"};
-  long since_num{-1};
+  int64_t since_num{-1};
   const char *rtc_sync{"skipped"};
   int rtc_sync_code{0};
-  long rtc_sync_age_sec{-1};
+  int64_t rtc_sync_age_sec{-1};
 };
+
+// Check whether a string contains a signed base-10 integer.
+inline bool is_signed_integer_str(const char *s) {
+  if (s == nullptr || s[0] == '\0') {
+    return false;
+  }
+  size_t i = 0U;
+  if (s[0] == '-' || s[0] == '+') {
+    i = 1U;
+    if (s[1] == '\0') {
+      return false;
+    }
+  }
+  for (; s[i] != '\0'; ++i) {
+    if (s[i] < '0' || s[i] > '9') {
+      return false;
+    }
+  }
+  return true;
+}
 
 inline void escape_prom_label(const char *src, char *dst, size_t dst_len) {
   if (dst == nullptr || dst_len == 0U) {
@@ -327,14 +367,19 @@ inline int format_vlogs_message(char *buf, size_t len, const TraceTelemetry &t) 
 
   char sync_age_buf[24];
   if (t.rtc_sync_age_sec >= 0) {
-    snprintf(sync_age_buf, sizeof(sync_age_buf), "%lds", t.rtc_sync_age_sec);
+    snprintf(sync_age_buf, sizeof(sync_age_buf), "%" PRId64 "s", t.rtc_sync_age_sec);
   } else {
     snprintf(sync_age_buf, sizeof(sync_age_buf), "unknown");
   }
 
+  const char *next_in_val = t.next_in_str != nullptr ? t.next_in_str : "unknown";
+  const char *next_in_unit = is_signed_integer_str(next_in_val) ? "s" : "";
+  const char *since_val = t.since_str != nullptr ? t.since_str : "unknown";
+  const char *since_unit = is_signed_integer_str(since_val) ? "s" : "";
+
   return snprintf(buf, len,
                   "wake=%s mode=%s batt=%s batt_pct=%s awake=%.1fs image=%s touch=%s "
-                  "now=%s next=%s next_in=%ss since=%ss slept=%s prev_gt911=%s boots=%" PRIu32
+                  "now=%s next=%s next_in=%s%s since=%s%s slept=%s prev_gt911=%s boots=%" PRIu32
                   " rtc_sync=%s rtc_sync_age=%s",
                   t.wake_reason != nullptr ? t.wake_reason : "unknown",
                   t.mode != nullptr ? t.mode : "none",
@@ -345,8 +390,10 @@ inline int format_vlogs_message(char *buf, size_t len, const TraceTelemetry &t) 
                   touch_buf,
                   t.now_str != nullptr ? t.now_str : "unknown",
                   t.next_str != nullptr ? t.next_str : "unknown",
-                  t.next_in_str != nullptr ? t.next_in_str : "unknown",
-                  t.since_str != nullptr ? t.since_str : "unknown",
+                  next_in_val,
+                  next_in_unit,
+                  since_val,
+                  since_unit,
                   t.prev_slept ? "yes" : "no",
                   gt_str,
                   t.boot_count,
@@ -369,6 +416,8 @@ inline int format_vmetrics_prometheus(char *buf, size_t len, const TraceTelemetr
                            "battery_voltage{job=\"%s\"} %.2f\n", job, t.batt_v);
     if (n > 0 && static_cast<size_t>(batt_len + n) < sizeof(batt_lines)) {
       batt_len += n;
+    } else {
+      batt_lines[batt_len] = '\0';
     }
   }
   if (std::isfinite(t.batt_pct)) {
@@ -376,18 +425,20 @@ inline int format_vmetrics_prometheus(char *buf, size_t len, const TraceTelemetr
                            "battery_percent{job=\"%s\"} %.0f\n", job, t.batt_pct);
     if (n > 0 && static_cast<size_t>(batt_len + n) < sizeof(batt_lines)) {
       batt_len += n;
+    } else {
+      batt_lines[batt_len] = '\0';
     }
   }
 
   return snprintf(buf, len,
                   "%s"
                   "wake_secs{job=\"%s\"} %.1f\n"
-                  "run_gap_secs{job=\"%s\"} %ld\n"
+                  "run_gap_secs{job=\"%s\"} %" PRId64 "\n"
                   "prev_slept{job=\"%s\"} %d\n"
                   "gt911_slept{job=\"%s\"} %d\n"
                   "boot_count{job=\"%s\"} %" PRIu32 "\n"
                   "rtc_synced{job=\"%s\"} %d\n"
-                  "rtc_sync_age_secs{job=\"%s\"} %ld",
+                  "rtc_sync_age_secs{job=\"%s\"} %" PRId64 "\n",
                   batt_lines,
                   job, awake_s,
                   job, t.since_num,
@@ -535,10 +586,6 @@ inline void release_sleep_holds_on_boot() {
   gpio_hold_dis(GPIO_NUM_47);
 }
 
-inline void register_power_latch() {
-  // Empty inline hook for component lifecycle registration.
-}
-
 inline bool check_usb_sof_incremented() {
 #if defined(CONFIG_IDF_TARGET_ESP32S3) && defined(USB_SERIAL_JTAG_FRAM_NUM_REG)
   const uint32_t frame1 = REG_READ(USB_SERIAL_JTAG_FRAM_NUM_REG) & USB_SERIAL_JTAG_SOF_FRAME_INDEX;
@@ -551,7 +598,7 @@ inline bool check_usb_sof_incremented() {
 }
 
 inline int sleep_gt911_and_hold_int_low(brd_rtc::I2cPort &i2c, int preferred_addr = 0) {
-  // Drive interrupt line low before sending sleep command.
+  // Drive the interrupt pin low before sending the sleep command.
   pinMode(47, OUTPUT);
   digitalWrite(47, LOW);
   delay(5);
@@ -569,7 +616,7 @@ inline int sleep_gt911_and_hold_int_low(brd_rtc::I2cPort &i2c, int preferred_add
   } else if (i2c.write(secondary_addr, sleep_cmd, 3)) {
     ack_addr = secondary_code;
   } else {
-    // Pulse interrupt high to wake controller and retry.
+    // Pulse the interrupt pin high to wake the controller. Then retry the write.
     digitalWrite(47, HIGH);
     delay(10);
     digitalWrite(47, LOW);
@@ -584,7 +631,7 @@ inline int sleep_gt911_and_hold_int_low(brd_rtc::I2cPort &i2c, int preferred_add
 
   delay(25);
 
-  // Hold interrupt line low during deep sleep.
+  // Hold the interrupt pin low during deep sleep.
   pinMode(47, OUTPUT);
   digitalWrite(47, LOW);
   gpio_hold_en(GPIO_NUM_47);

@@ -17,14 +17,32 @@ constexpr uint8_t bcd_to_dec(uint8_t val) {
   return static_cast<uint8_t>(((val >> 4) * 10) + (val & 0x0F));
 }
 
-// Verify that both nibbles contain valid decimal digits.
+// Check that both nibbles contain valid decimal digits.
 constexpr bool is_valid_bcd(uint8_t val) {
   return ((val & 0x0F) <= 9) && ((val >> 4) <= 9);
 }
 
+// Return true when year is a Gregorian leap year.
+constexpr bool is_leap_year(uint16_t year) {
+  return (year % 4U == 0U) && ((year % 100U != 0U) || (year % 400U == 0U));
+}
+
+// Return days in the given month and year, or 0 for an invalid month.
+constexpr uint8_t days_in_month(uint16_t year, uint8_t month) {
+  constexpr uint8_t DAYS[12] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+  if (month < 1 || month > 12) {
+    return 0;
+  }
+  if (month == 2 && is_leap_year(year)) {
+    return 29;
+  }
+  return DAYS[month - 1];
+}
+
 // Compute ESPTime weekday index (1 for Sunday through 7 for Saturday).
 constexpr uint8_t compute_esphome_weekday(uint16_t year, uint8_t month, uint8_t day) {
-  if (year < 1 || month < 1 || month > 12 || day < 1 || day > 31) {
+  const uint8_t dim = days_in_month(year, month);
+  if (year < 1 || dim == 0 || day < 1 || day > dim) {
     return 0;
   }
   constexpr int MONTH_OFFSETS[12] = {0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4};
@@ -86,7 +104,7 @@ inline bool retry_write_read(I2cPort &i2c, uint8_t addr, const uint8_t *wdata, s
   return false;
 }
 
-// Repair weekday register when voltage-low flag is clear and date is valid.
+// Repair the weekday register when the voltage-low flag is clear and the date is valid.
 inline bool repair_sunday_weekday_if_valid(I2cPort &i2c, uint8_t rtc_addr) {
   const uint8_t reg02_addr = 0x02;
   uint8_t buf[7]{};
@@ -107,7 +125,8 @@ inline bool repair_sunday_weekday_if_valid(I2cPort &i2c, uint8_t rtc_addr) {
   const uint8_t day = bcd_to_dec(day_bcd);
   const uint8_t month = bcd_to_dec(month_bcd);
   const uint16_t year = static_cast<uint16_t>(2000U + bcd_to_dec(year_bcd));
-  if (year < 2024 || month < 1 || month > 12 || day < 1 || day > 31) {
+  const uint8_t dim = days_in_month(year, month);
+  if (year < 2024 || dim == 0 || day < 1 || day > dim) {
     return true;
   }
 
@@ -123,7 +142,9 @@ inline bool repair_sunday_weekday_if_valid(I2cPort &i2c, uint8_t rtc_addr) {
   return true;
 }
 
-// Read status flags before clearing register 0x01 and disable clock output.
+// Read status flags from register 0x01.
+// Clear control registers 0x00 and 0x01.
+// Disable clock output and repair the weekday register.
 inline bool read_and_clear_status_and_disable_clkout(I2cPort &i2c, uint8_t rtc_addr,
                                                     RtcStatus &status) {
   const uint8_t reg01_addr = 0x01;
@@ -134,6 +155,12 @@ inline bool read_and_clear_status_and_disable_clkout(I2cPort &i2c, uint8_t rtc_a
 
   status.alarm_flag = (reg01_val & 0x08) != 0;
   status.timer_flag = (reg01_val & 0x04) != 0;
+
+  // Clear STOP and TEST bits in Control_status_1 so the oscillator runs.
+  const uint8_t clear_ctrl1[2] = {0x00, 0x00};
+  if (!retry_write(i2c, rtc_addr, clear_ctrl1, 2)) {
+    return false;
+  }
 
   const uint8_t clear_status[2] = {0x01, 0x00};
   if (!retry_write(i2c, rtc_addr, clear_status, 2)) {
@@ -148,9 +175,15 @@ inline bool read_and_clear_status_and_disable_clkout(I2cPort &i2c, uint8_t rtc_a
   return repair_sunday_weekday_if_valid(i2c, rtc_addr);
 }
 
-// Write UTC clock values to registers 0x02 through 0x08, ensure the oscillator runs, and disable clock output.
+// Write UTC time fields to registers 0x02 through 0x08.
+// Clear the STOP bit to run the oscillator.
+// Disable the clock output pin.
 inline bool write_utc_clock_only(I2cPort &i2c, uint8_t rtc_addr, const UtcClock &clk) {
   if (clk.year < 2000 || clk.year > 2099 || clk.hour > 23 || clk.minute > 59 || clk.second > 59) {
+    return false;
+  }
+  const uint8_t dim = days_in_month(clk.year, clk.month);
+  if (dim == 0 || clk.day < 1 || clk.day > dim) {
     return false;
   }
   const uint8_t esphome_wday = compute_esphome_weekday(clk.year, clk.month, clk.day);
@@ -182,9 +215,143 @@ inline bool write_utc_clock_only(I2cPort &i2c, uint8_t rtc_addr, const UtcClock 
   return retry_write(i2c, rtc_addr, clkout_buf, 2);
 }
 
-// Configure wake alarm or timer on hardware RTC with verification.
+namespace detail {
+
+// Disable the hardware RTC timer and clear interrupt enable bits.
+inline void disarm_rtc_best_effort(I2cPort &i2c, uint8_t rtc_addr) {
+  const uint8_t disarm_timer[2] = {0x0E, 0x00};
+  const uint8_t disarm_ctrl[2] = {0x01, 0x00};
+  (void)retry_write(i2c, rtc_addr, disarm_timer, 2);
+  (void)retry_write(i2c, rtc_addr, disarm_ctrl, 2);
+}
+
+inline bool arm_alarm_wake(I2cPort &i2c, uint8_t rtc_addr, const WakeSettings &settings) {
+  const uint8_t min_bcd = dec_to_bcd(settings.target_utc_minute) & 0x7F;
+  const uint8_t hr_bcd = dec_to_bcd(settings.target_utc_hour) & 0x3F;
+  const uint8_t alarm_cfg[5] = {0x09, min_bcd, hr_bcd, 0x80, 0x80};
+
+  if (!retry_write(i2c, rtc_addr, alarm_cfg, 5)) {
+    return false;
+  }
+
+  // Enable the alarm interrupt flag.
+  const uint8_t enable_aie[2] = {0x01, 0x02};
+  if (!retry_write(i2c, rtc_addr, enable_aie, 2)) {
+    return false;
+  }
+
+  // Read register 0x01 to check AIE and cleared status flags.
+  const uint8_t reg01_addr = 0x01;
+  uint8_t reg01_val = 0;
+  if (!retry_write_read(i2c, rtc_addr, &reg01_addr, 1, &reg01_val, 1)) {
+    return false;
+  }
+  if ((reg01_val & 0x02U) == 0 || (reg01_val & 0x0CU) != 0) {
+    return false;
+  }
+
+  // Read registers 0x09 through 0x0C to check alarm time and AE bits.
+  const uint8_t reg09_addr = 0x09;
+  uint8_t alarm_rb[4] = {0, 0, 0, 0};
+  if (!retry_write_read(i2c, rtc_addr, &reg09_addr, 1, alarm_rb, 4)) {
+    return false;
+  }
+  // Mask unused bit 6 in Hour_alarm (0x0A) while keeping AE_H at 0.
+  if (alarm_rb[0] != min_bcd || (alarm_rb[1] & 0xBFU) != hr_bcd) {
+    return false;
+  }
+  if ((alarm_rb[2] & 0x80U) == 0 || (alarm_rb[3] & 0x80U) == 0) {
+    return false;
+  }
+
+  return true;
+}
+
+inline bool arm_timer_wake(I2cPort &i2c, uint8_t rtc_addr, const WakeSettings &settings) {
+  // Disable all four alarm registers while the countdown timer runs.
+  const uint8_t disable_alarm[5] = {0x09, 0x80, 0x80, 0x80, 0x80};
+  if (!retry_write(i2c, rtc_addr, disable_alarm, 5)) {
+    return false;
+  }
+
+  uint8_t timer_ctrl = 0;
+  uint8_t timer_val = 0;
+  if (settings.sleep_seconds > 255U) {
+    timer_ctrl = 0x83;
+    uint32_t mins = (settings.sleep_seconds >= 255U * 60U)
+                        ? 255U
+                        : ((settings.sleep_seconds + 30U) / 60U);
+    if (mins == 0U) {
+      mins = 1U;
+    }
+    timer_val = static_cast<uint8_t>(mins);
+  } else {
+    timer_ctrl = 0x82;
+    uint32_t secs = settings.sleep_seconds;
+    if (secs == 0U) {
+      secs = 1U;
+    }
+    timer_val = static_cast<uint8_t>(secs);
+  }
+
+  // Select timer frequency with TE cleared before loading register 0x0F.
+  const uint8_t prep_timer_ctrl[2] = {0x0E, static_cast<uint8_t>(timer_ctrl & 0x7FU)};
+  if (!retry_write(i2c, rtc_addr, prep_timer_ctrl, 2)) {
+    return false;
+  }
+
+  const uint8_t write_timer_val[2] = {0x0F, timer_val};
+  if (!retry_write(i2c, rtc_addr, write_timer_val, 2)) {
+    return false;
+  }
+
+  // Read register 0x0F while TE is 0 so the prescaler cannot decrement it first.
+  const uint8_t reg0f_addr = 0x0F;
+  uint8_t reg0f_val = 0;
+  if (!retry_write_read(i2c, rtc_addr, &reg0f_addr, 1, &reg0f_val, 1) || reg0f_val != timer_val) {
+    return false;
+  }
+
+  // Clear status flags and enable the timer interrupt.
+  const uint8_t enable_tie[2] = {0x01, 0x01};
+  if (!retry_write(i2c, rtc_addr, enable_tie, 2)) {
+    return false;
+  }
+
+  // Enable the countdown timer last after loading its value and interrupt mask.
+  const uint8_t start_timer[2] = {0x0E, timer_ctrl};
+  if (!retry_write(i2c, rtc_addr, start_timer, 2)) {
+    return false;
+  }
+
+  // Read register 0x0E and mask unused bits 6 through 2.
+  const uint8_t reg0e_addr = 0x0E;
+  uint8_t reg0e_val = 0;
+  if (!retry_write_read(i2c, rtc_addr, &reg0e_addr, 1, &reg0e_val, 1) ||
+      (reg0e_val & 0x83U) != timer_ctrl) {
+    return false;
+  }
+
+  // Read register 0x01 to check TIE and cleared status flags.
+  const uint8_t reg01_addr = 0x01;
+  uint8_t reg01_val = 0;
+  if (!retry_write_read(i2c, rtc_addr, &reg01_addr, 1, &reg01_val, 1) ||
+      (reg01_val & 0x01U) == 0 || (reg01_val & 0x0CU) != 0) {
+    return false;
+  }
+
+  return true;
+}
+
+}  // namespace detail
+
+// Set and check the wake alarm or countdown timer on the hardware RTC.
 inline bool arm_wake(I2cPort &i2c, uint8_t rtc_addr, const WakeSettings &settings) {
-  // Stop countdown timer first.
+  if (settings.use_alarm && (settings.target_utc_hour > 23 || settings.target_utc_minute > 59)) {
+    return false;
+  }
+
+  // Stop the countdown timer first.
   const uint8_t stop_timer[2] = {0x0E, 0x00};
   if (!retry_write(i2c, rtc_addr, stop_timer, 2)) {
     return false;
@@ -196,102 +363,10 @@ inline bool arm_wake(I2cPort &i2c, uint8_t rtc_addr, const WakeSettings &setting
     return false;
   }
 
-  if (settings.use_alarm) {
-    const uint8_t min_bcd = dec_to_bcd(settings.target_utc_minute) & 0x7F;
-    const uint8_t hr_bcd = dec_to_bcd(settings.target_utc_hour) & 0x3F;
-    const uint8_t alarm_cfg[5] = {0x09, min_bcd, hr_bcd, 0x80, 0x80};
-
-    if (!retry_write(i2c, rtc_addr, alarm_cfg, 5)) {
-      return false;
-    }
-
-    // Enable alarm interrupt flag.
-    const uint8_t enable_aie[2] = {0x01, 0x02};
-    if (!retry_write(i2c, rtc_addr, enable_aie, 2)) {
-      return false;
-    }
-
-    // Read register 0x01 to verify the alarm interrupt flag.
-    const uint8_t reg01_addr = 0x01;
-    uint8_t reg01_val = 0;
-    if (!retry_write_read(i2c, rtc_addr, &reg01_addr, 1, &reg01_val, 1)) {
-      return false;
-    }
-    if ((reg01_val & 0x02) == 0) {
-      return false;
-    }
-
-    // Read alarm registers to verify the target time.
-    const uint8_t reg09_addr = 0x09;
-    uint8_t alarm_rb[2] = {0, 0};
-    if (!retry_write_read(i2c, rtc_addr, &reg09_addr, 1, alarm_rb, 2)) {
-      return false;
-    }
-    if ((alarm_rb[0] & 0x7F) != min_bcd || (alarm_rb[1] & 0x3F) != hr_bcd) {
-      return false;
-    }
-
-    return true;
-  }
-
-  // Disable alarm registers when timer operates.
-  const uint8_t disable_alarm[3] = {0x09, 0x80, 0x80};
-  if (!retry_write(i2c, rtc_addr, disable_alarm, 3)) {
-    return false;
-  }
-
-  uint8_t timer_ctrl = 0;
-  uint8_t timer_val = 0;
-  if (settings.sleep_seconds > 255) {
-    timer_ctrl = 0x83;
-    uint32_t mins = (settings.sleep_seconds + 30U) / 60U;
-    if (mins > 255) {
-      mins = 255;
-    }
-    if (mins == 0) {
-      mins = 1;
-    }
-    timer_val = static_cast<uint8_t>(mins);
-  } else {
-    timer_ctrl = 0x82;
-    uint32_t secs = settings.sleep_seconds;
-    if (secs > 255) {
-      secs = 255;
-    }
-    if (secs == 0) {
-      secs = 1;
-    }
-    timer_val = static_cast<uint8_t>(secs);
-  }
-
-  const uint8_t timer_cfg[3] = {0x0E, timer_ctrl, timer_val};
-  if (!retry_write(i2c, rtc_addr, timer_cfg, 3)) {
-    return false;
-  }
-
-  // Enable timer interrupt.
-  const uint8_t enable_tie[2] = {0x01, 0x01};
-  if (!retry_write(i2c, rtc_addr, enable_tie, 2)) {
-    return false;
-  }
-
-  // Read register 0x01 to verify the timer interrupt flag.
-  const uint8_t reg01_addr = 0x01;
-  uint8_t reg01_val = 0;
-  if (!retry_write_read(i2c, rtc_addr, &reg01_addr, 1, &reg01_val, 1)) {
-    return false;
-  }
-  if ((reg01_val & 0x01) == 0) {
-    return false;
-  }
-
-  // Read register 0x0E to verify timer activation.
-  const uint8_t reg0e_addr = 0x0E;
-  uint8_t reg0e_val = 0;
-  if (!retry_write_read(i2c, rtc_addr, &reg0e_addr, 1, &reg0e_val, 1)) {
-    return false;
-  }
-  if ((reg0e_val & 0x80) == 0) {
+  const bool armed = settings.use_alarm ? detail::arm_alarm_wake(i2c, rtc_addr, settings)
+                                        : detail::arm_timer_wake(i2c, rtc_addr, settings);
+  if (!armed) {
+    detail::disarm_rtc_best_effort(i2c, rtc_addr);
     return false;
   }
 

@@ -80,6 +80,34 @@ func TestIsPriorDay(t *testing.T) {
 			loc:  zurich,
 			want: false,
 		},
+		{
+			name: "DST fall-back repeated hour same calendar day",
+			t:    time.Date(2026, 10, 25, 0, 30, 0, 0, time.UTC), // 02:30 CEST (+0200)
+			now:  time.Date(2026, 10, 25, 1, 30, 0, 0, time.UTC), // 02:30 CET (+0100)
+			loc:  zurich,
+			want: false,
+		},
+		{
+			name: "DST fall-back repeated hour after previous day",
+			t:    time.Date(2026, 10, 24, 21, 59, 0, 0, time.UTC), // 2026-10-24 23:59 CEST
+			now:  time.Date(2026, 10, 25, 1, 30, 0, 0, time.UTC),  // 2026-10-25 02:30 CET
+			loc:  zurich,
+			want: true,
+		},
+		{
+			name: "prior year returns true",
+			t:    time.Date(2025, 12, 31, 23, 59, 0, 0, zurich),
+			now:  time.Date(2026, 1, 1, 0, 1, 0, 0, zurich),
+			loc:  zurich,
+			want: true,
+		},
+		{
+			name: "prior month returns true",
+			t:    time.Date(2026, 5, 31, 23, 59, 0, 0, zurich),
+			now:  time.Date(2026, 6, 1, 0, 1, 0, 0, zurich),
+			loc:  zurich,
+			want: true,
+		},
 	}
 
 	for _, tc := range tests {
@@ -222,6 +250,48 @@ func TestFormatElapsed(t *testing.T) {
 			t:    time.Date(2026, 1, 31, 12, 0, 0, 0, time.UTC),
 			now:  time.Date(2026, 2, 28, 11, 0, 0, 0, time.UTC),
 			want: "27d 23:00",
+		},
+		{
+			name: "sub-minute 29s rounds down to 00:00",
+			t:    time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC),
+			now:  time.Date(2026, 6, 15, 12, 0, 29, 0, time.UTC),
+			want: "00:00",
+		},
+		{
+			name: "sub-minute 30s rounds up to 00:01",
+			t:    time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC),
+			now:  time.Date(2026, 6, 15, 12, 0, 30, 0, time.UTC),
+			want: "00:01",
+		},
+		{
+			name: "23h spring-forward day in Zurich",
+			t:    time.Date(2026, 3, 29, 0, 0, 0, 0, zurich),
+			now:  time.Date(2026, 3, 30, 0, 0, 0, 0, zurich),
+			want: "23:00",
+		},
+		{
+			name: "25h fall-back day in Zurich",
+			t:    time.Date(2026, 10, 25, 0, 0, 0, 0, zurich),
+			now:  time.Date(2026, 10, 26, 0, 0, 0, 0, zurich),
+			want: "1d 01:00",
+		},
+		{
+			name: "leap-day anniversary to non-leap Feb 28",
+			t:    time.Date(2024, 2, 29, 12, 0, 0, 0, time.UTC),
+			now:  time.Date(2025, 2, 28, 12, 0, 0, 0, time.UTC),
+			want: "1y 0m 0d 00:00",
+		},
+		{
+			name: "leap-day anniversary to next leap Feb 29",
+			t:    time.Date(2024, 2, 29, 12, 0, 0, 0, time.UTC),
+			now:  time.Date(2028, 2, 29, 12, 0, 0, 0, time.UTC),
+			want: "4y 0m 0d 00:00",
+		},
+		{
+			name: "negative year guards negative modulo",
+			t:    time.Date(-1, 12, 15, 12, 0, 0, 0, time.UTC),
+			now:  time.Date(0, 1, 15, 12, 0, 0, 0, time.UTC),
+			want: "1m 0d 00:00",
 		},
 	}
 

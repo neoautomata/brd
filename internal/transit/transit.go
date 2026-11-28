@@ -3,10 +3,12 @@ package transit
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"sort"
 	"strings"
 	"sync"
@@ -14,11 +16,14 @@ import (
 )
 
 const (
-	defaultCacheDuration = 10 * time.Minute
-	defaultErrorBackoff  = 30 * time.Second
-	defaultMaxStaleAge   = 2 * time.Hour
-	maxResponseBytes     = 2 << 20 // 2 MiB
-	defaultMaxDepartures = 4
+	defaultCacheDuration  = 10 * time.Minute
+	defaultErrorBackoff   = 30 * time.Second
+	defaultMaxStaleAge    = 2 * time.Hour
+	defaultRequestTimeout = 10 * time.Second
+	maxResponseBytes      = 2 << 20 // 2 MiB
+	defaultMaxDepartures  = 4
+	maxRedirects          = 5
+	maxDelayMinutes       = 24 * 60
 )
 
 // FlexibleString unmarshals both JSON strings and JSON numbers into a string.
@@ -27,9 +32,15 @@ type FlexibleString string
 // UnmarshalJSON decodes a string, number, or null JSON value.
 func (fs *FlexibleString) UnmarshalJSON(b []byte) error {
 	raw := strings.TrimSpace(string(b))
+	if raw == "" {
+		return errors.New("empty JSON value")
+	}
 	if raw == "null" {
 		*fs = ""
 		return nil
+	}
+	if raw[0] == '{' || raw[0] == '[' {
+		return errors.New("cannot decode JSON object or array into FlexibleString")
 	}
 	var s string
 	if err := json.Unmarshal(b, &s); err == nil {
@@ -41,8 +52,7 @@ func (fs *FlexibleString) UnmarshalJSON(b []byte) error {
 		*fs = FlexibleString(n.String())
 		return nil
 	}
-	*fs = FlexibleString(strings.Trim(raw, `"`))
-	return nil
+	return fmt.Errorf("cannot decode %s into FlexibleString", raw)
 }
 
 // Station represents a transit stop in the stationboard API.
@@ -99,7 +109,7 @@ type LineDepartures struct {
 // Service fetches, caches, and formats transit departures.
 type Service struct {
 	mu            sync.RWMutex
-	fetchMu       sync.Mutex
+	fetchSem      chan struct{}
 	apiURL        string
 	cacheDuration time.Duration
 	errorBackoff  time.Duration
@@ -111,6 +121,7 @@ type Service struct {
 	cachedResponse *StationboardResponse
 	cachedAt       time.Time
 	lastErrAt      time.Time
+	lastErr        error
 }
 
 // NewService constructs a transit Service with explicit dependencies.
@@ -119,7 +130,7 @@ func NewService(apiURL string, cacheDuration time.Duration, client *http.Client,
 		cacheDuration = defaultCacheDuration
 	}
 	if client == nil {
-		client = &http.Client{Timeout: 10 * time.Second}
+		client = &http.Client{Timeout: defaultRequestTimeout}
 	}
 	lines := make([]string, len(filter.Lines))
 	copy(lines, filter.Lines)
@@ -131,6 +142,7 @@ func NewService(apiURL string, cacheDuration time.Duration, client *http.Client,
 	}
 
 	return &Service{
+		fetchSem:      make(chan struct{}, 1),
 		apiURL:        strings.TrimSpace(apiURL),
 		cacheDuration: cacheDuration,
 		errorBackoff:  defaultErrorBackoff,
@@ -142,15 +154,15 @@ func NewService(apiURL string, cacheDuration time.Duration, client *http.Client,
 }
 
 // Fetch returns cached departures when fresh or queries the remote API.
-// Concurrent misses serialize via fetchMu to avoid upstream stampedes, and transient errors
-// back off briefly while falling back to bounded stale cache.
+// Concurrent cache misses share one fetch slot to prevent duplicate upstream requests.
+// After a transient error, Fetch pauses retries and returns bounded stale data when available.
 func (s *Service) Fetch(ctx context.Context) (*StationboardResponse, error) {
 	now := s.nowFn()
 
 	s.mu.RLock()
-	if resp, ok := s.usableCacheLocked(now); ok {
+	if resp, err, ok := s.cachedOutcomeLocked(now); ok {
 		s.mu.RUnlock()
-		return resp, nil
+		return resp, err
 	}
 	targetURL := s.apiURL
 	client := s.httpClient
@@ -159,15 +171,22 @@ func (s *Service) Fetch(ctx context.Context) (*StationboardResponse, error) {
 	if targetURL == "" {
 		return &StationboardResponse{}, nil
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
-	s.fetchMu.Lock()
-	defer s.fetchMu.Unlock()
+	select {
+	case s.fetchSem <- struct{}{}:
+		defer func() { <-s.fetchSem }()
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 
 	now = s.nowFn()
 	s.mu.RLock()
-	if resp, ok := s.usableCacheLocked(now); ok {
+	if resp, err, ok := s.cachedOutcomeLocked(now); ok {
 		s.mu.RUnlock()
-		return resp, nil
+		return resp, err
 	}
 	stale := s.cachedResponse
 	staleAt := s.cachedAt
@@ -175,12 +194,16 @@ func (s *Service) Fetch(ctx context.Context) (*StationboardResponse, error) {
 
 	fresh, err := fetchStationboard(ctx, client, targetURL)
 	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			return nil, err
+		}
 		errNow := s.nowFn()
 		s.mu.Lock()
 		s.lastErrAt = errNow
+		s.lastErr = err
 		s.mu.Unlock()
 		if stale != nil && errNow.Sub(staleAt) <= s.maxStaleAge {
-			log.Printf("Transit fetch failed, using stale cache: %v", err)
+			log.Printf("Transit fetch failed. Using stale cache: %v", err)
 			return stale, nil
 		}
 		return nil, err
@@ -190,23 +213,25 @@ func (s *Service) Fetch(ctx context.Context) (*StationboardResponse, error) {
 	s.cachedResponse = fresh
 	s.cachedAt = s.nowFn()
 	s.lastErrAt = time.Time{}
+	s.lastErr = nil
 	s.mu.Unlock()
 
 	return fresh, nil
 }
 
-func (s *Service) usableCacheLocked(now time.Time) (*StationboardResponse, bool) {
-	if s.cachedResponse == nil {
-		return nil, false
+func (s *Service) cachedOutcomeLocked(now time.Time) (*StationboardResponse, error, bool) {
+	if s.cachedResponse != nil && now.Sub(s.cachedAt) < s.cacheDuration {
+		return s.cachedResponse, nil, true
 	}
-	age := now.Sub(s.cachedAt)
-	if age < s.cacheDuration {
-		return s.cachedResponse, true
+	if !s.lastErrAt.IsZero() && now.Sub(s.lastErrAt) < s.errorBackoff {
+		if s.cachedResponse != nil && now.Sub(s.cachedAt) <= s.maxStaleAge {
+			return s.cachedResponse, nil, true
+		}
+		if s.lastErr != nil {
+			return nil, s.lastErr, true
+		}
 	}
-	if !s.lastErrAt.IsZero() && now.Sub(s.lastErrAt) < s.errorBackoff && age <= s.maxStaleAge {
-		return s.cachedResponse, true
-	}
-	return nil, false
+	return nil, nil, false
 }
 
 // NextDepartures fetches and formats upcoming departures for each configured line.
@@ -229,13 +254,49 @@ func (s *Service) NextDepartures(ctx context.Context, now time.Time, loc *time.L
 	return FilterAndFormatDepartures(resp.Stationboard, now, loc, s.filter)
 }
 
+func validateTargetURL(rawURL string) error {
+	u, err := url.Parse(rawURL)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return fmt.Errorf("invalid transit URL %q", rawURL)
+	}
+	return nil
+}
+
 func fetchStationboard(ctx context.Context, client *http.Client, targetURL string) (*StationboardResponse, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
+	if err := validateTargetURL(targetURL); err != nil {
+		return nil, err
+	}
+
+	reqCtx := ctx
+	if client.Timeout == 0 {
+		if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+			var cancel context.CancelFunc
+			reqCtx, cancel = context.WithTimeout(ctx, defaultRequestTimeout)
+			defer cancel()
+		}
+	}
+
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, targetURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("create transit request: %w", err)
 	}
 
-	resp, err := client.Do(req)
+	reqClient := *client
+	origCheckRedirect := reqClient.CheckRedirect
+	reqClient.CheckRedirect = func(nextReq *http.Request, via []*http.Request) error {
+		if len(via) >= maxRedirects {
+			return fmt.Errorf("transit request exceeded %d redirects", maxRedirects)
+		}
+		if nextReq.URL == nil || (nextReq.URL.Scheme != "http" && nextReq.URL.Scheme != "https") || nextReq.URL.Host == "" {
+			return fmt.Errorf("transit redirect uses invalid URL")
+		}
+		if origCheckRedirect != nil {
+			return origCheckRedirect(nextReq, via)
+		}
+		return nil
+	}
+
+	resp, err := reqClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("execute transit request: %w", err)
 	}
@@ -312,6 +373,9 @@ func FilterAndFormatDepartures(items []StationboardItem, now time.Time, loc *tim
 		effectiveTime := depTime
 		entryText := hhmm
 		if item.Stop.Delay != nil && *item.Stop.Delay > 0 {
+			if *item.Stop.Delay > maxDelayMinutes {
+				continue
+			}
 			effectiveTime = depTime.Add(time.Duration(*item.Stop.Delay) * time.Minute)
 			entryText = fmt.Sprintf("%s (+%d)", hhmm, *item.Stop.Delay)
 		}
@@ -348,6 +412,7 @@ func parseDepartureTime(depStr string, depTs int64, now time.Time, loc *time.Loc
 	if loc == nil {
 		loc = time.UTC
 	}
+	depStr = strings.TrimSpace(depStr)
 
 	var parsed time.Time
 	var err error
@@ -369,6 +434,8 @@ func parseDepartureTime(depStr string, depTs int64, now time.Time, loc *time.Loc
 					parsed = time.Date(nowInLoc.Year(), nowInLoc.Month(), nowInLoc.Day(), pt.Hour(), pt.Minute(), 0, 0, loc)
 					if nowInLoc.Sub(parsed) > 12*time.Hour {
 						parsed = parsed.AddDate(0, 0, 1)
+					} else if parsed.Sub(nowInLoc) > 12*time.Hour {
+						parsed = parsed.AddDate(0, 0, -1)
 					}
 					err = nil
 					break
@@ -384,7 +451,7 @@ func parseDepartureTime(depStr string, depTs int64, now time.Time, loc *time.Loc
 			}
 		}
 	} else {
-		return time.Time{}, "", fmt.Errorf("missing departure time")
+		return time.Time{}, "", errors.New("missing departure time")
 	}
 
 	if err != nil {

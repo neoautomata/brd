@@ -12,11 +12,15 @@ func IsPriorDay(t, now time.Time, loc *time.Location) bool {
 	if loc == nil {
 		loc = time.UTC
 	}
-	nowInLoc := now.In(loc)
-	tInLoc := t.In(loc)
-	todayMidnight := time.Date(nowInLoc.Year(), nowInLoc.Month(), nowInLoc.Day(), 0, 0, 0, 0, loc)
-	tDate := time.Date(tInLoc.Year(), tInLoc.Month(), tInLoc.Day(), 0, 0, 0, 0, loc)
-	return tDate.Before(todayMidnight)
+	ty, tm, td := t.In(loc).Date()
+	ny, nm, nd := now.In(loc).Date()
+	if ty != ny {
+		return ty < ny
+	}
+	if tm != nm {
+		return tm < nm
+	}
+	return td < nd
 }
 
 // DaysInMonth returns the number of calendar days in the given year and month.
@@ -24,17 +28,16 @@ func DaysInMonth(year int, month time.Month) int {
 	return time.Date(year, month+1, 0, 0, 0, 0, 0, time.UTC).Day()
 }
 
-// FormatElapsed formats the elapsed calendar duration from t to now as
-// "[Yy ][Mm ][Dd ]HH:MM", omitting leading zero calendar units.
-// It computes calendar steps in UTC so daylight saving shifts never distort elapsed time.
-// It returns "00:00" when now is before t.
+// FormatElapsed formats the elapsed duration from t to now as "[Yy ][Mm ][Dd ]HH:MM".
+// It omits leading zero calendar units and returns "00:00" when now is before t.
+// It calculates calendar steps in UTC so daylight saving shifts do not distort elapsed time.
 func FormatElapsed(t, now time.Time) string {
 	if now.Before(t) {
 		return "00:00"
 	}
 
-	// Round the elapsed duration to the nearest minute before splitting calendar
-	// fields so 23h59m45s carries cleanly into the next day instead of "24:00".
+	// Round the elapsed duration to the nearest minute before splitting fields.
+	// This prevents 23h59m45s from formatting as "24:00".
 	roundedDelta := now.Sub(t).Round(time.Minute)
 	if roundedDelta <= 0 {
 		return "00:00"
@@ -84,12 +87,17 @@ func FormatElapsed(t, now time.Time) string {
 	return sb.String()
 }
 
-// addCalendarMonthsUTC advances t by months, clamping day-of-month to the target month's length.
+// addCalendarMonthsUTC advances t by months and clamps the day to the target month length.
 func addCalendarMonthsUTC(t time.Time, months int) time.Time {
 	y, m, d := t.Date()
 	total := (y*12 + int(m) - 1) + months
 	targetYear := total / 12
-	targetMonth := time.Month(total%12 + 1)
+	remMonth := total % 12
+	if remMonth < 0 {
+		remMonth += 12
+		targetYear--
+	}
+	targetMonth := time.Month(remMonth + 1)
 	maxDay := DaysInMonth(targetYear, targetMonth)
 	if d > maxDay {
 		d = maxDay

@@ -33,4 +33,5 @@ web_server:
 
 ota:
   - platform: esphome
+    id: !extend brd_ota
     password: !secret ota_password

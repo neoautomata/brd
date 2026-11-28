@@ -187,6 +187,8 @@ class PosixTzCalendar : public CalendarPort {
   std::string tz_;
 };
 
+constexpr uint32_t MIN_FALLBACK_SLEEP_SEC = 60U;
+
 struct ScheduleConfig {
   int wake_hour{7};
   int wake_minute{0};
@@ -200,6 +202,15 @@ struct ScheduleConfig {
   uint32_t fallback_sleep_sec{900};
 };
 
+// Check that wake and sleep clock fields stay within valid ranges and sleep follows wake.
+constexpr bool is_valid_schedule_config(const ScheduleConfig &cfg) {
+  if (cfg.wake_hour < 0 || cfg.wake_hour > 23 || cfg.wake_minute < 0 || cfg.wake_minute > 59 ||
+      cfg.sleep_hour < 0 || cfg.sleep_hour > 23 || cfg.sleep_minute < 0 || cfg.sleep_minute > 59) {
+    return false;
+  }
+  return (cfg.sleep_hour * 60 + cfg.sleep_minute) > (cfg.wake_hour * 60 + cfg.wake_minute);
+}
+
 struct SchedulePlan {
   const char *mode{"timer"};
   int64_t target_epoch{0};
@@ -212,14 +223,16 @@ struct SchedulePlan {
 
 inline SchedulePlan plan_next_wake(const CalendarPort &cal, int64_t now_epoch,
                                    const ScheduleConfig &cfg = {}) {
+  const uint32_t fallback_sec = std::max(cfg.fallback_sleep_sec, MIN_FALLBACK_SLEEP_SEC);
+
   SchedulePlan plan;
   plan.mode = "timer";
   plan.target_epoch = 0;
-  plan.sleep_seconds = cfg.fallback_sleep_sec;
+  plan.sleep_seconds = fallback_sec;
   plan.clock_valid = false;
   plan.arm_alarm = false;
 
-  if (now_epoch <= 0) {
+  if (now_epoch <= 0 || !is_valid_schedule_config(cfg)) {
     return plan;
   }
 
@@ -227,6 +240,15 @@ inline SchedulePlan plan_next_wake(const CalendarPort &cal, int64_t now_epoch,
   if (!cal.epoch_to_local(now_epoch, now_local) || now_local.year < 2020) {
     return plan;
   }
+
+  const int interval_min =
+      (cfg.boundary_interval_min >= 1 && cfg.boundary_interval_min <= 1440)
+          ? cfg.boundary_interval_min
+          : 15;
+  const int lead_margin_sec = std::max(cfg.lead_margin_sec, 0);
+  const int min_alarm_lead = std::max(cfg.min_alarm_lead_sec, 0);
+  const int max_alarm_lead = std::max(cfg.max_alarm_lead_sec, min_alarm_lead);
+  const int bedtime_threshold = std::max(cfg.bedtime_advance_threshold_sec, 0);
 
   const int now_sec = now_local.hour * 3600 + now_local.minute * 60 + now_local.second;
   const int wake_sec = cfg.wake_hour * 3600 + cfg.wake_minute * 60;
@@ -241,13 +263,13 @@ inline SchedulePlan plan_next_wake(const CalendarPort &cal, int64_t now_epoch,
     return plan;
   }
 
+  const char *planned_mode = "timer";
   int64_t target_epoch = 0;
 
   if (now_sec >= wake_sec && now_sec < sleep_sec) {
-    plan.mode = "timer";
+    planned_mode = "timer";
 
-    // Find next interval boundary with lead margin.
-    const int interval_min = cfg.boundary_interval_min > 0 ? cfg.boundary_interval_min : 15;
+    // Advance across interval boundaries until the candidate meets the lead margin.
     const int next_min = ((now_local.minute / interval_min) + 1) * interval_min;
     WallTime cand = now_local;
     cand.second = 0;
@@ -261,28 +283,32 @@ inline SchedulePlan plan_next_wake(const CalendarPort &cal, int64_t now_epoch,
       return plan;
     }
 
-    if (cand_epoch - now_epoch < cfg.lead_margin_sec) {
+    // Step across fall-back ambiguous hours or small intervals with large lead margins.
+    constexpr int MAX_BOUNDARY_STEPS = 64;
+    for (int step = 0; step < MAX_BOUNDARY_STEPS && (cand_epoch - now_epoch) < lead_margin_sec;
+         ++step) {
       cand.minute += interval_min;
       if (!normalize_civil_datetime(cand) || !cal.local_to_epoch(cand, cand_epoch)) {
         return plan;
       }
     }
+    if ((cand_epoch - now_epoch) < lead_margin_sec) {
+      return plan;
+    }
 
     if (cand_epoch >= bedtime_epoch) {
-      if (bedtime_epoch - now_epoch >= cfg.bedtime_advance_threshold_sec) {
+      if (bedtime_epoch - now_epoch >= bedtime_threshold) {
         target_epoch = bedtime_epoch;
-        plan.mode = "timer";
+        planned_mode = "timer";
       } else {
-        // Advance to next morning wake time.
-        plan.mode = "alarm";
-        WallTime next_day {};
-        if (!cal.epoch_to_local(bedtime_epoch + 86400, next_day)) {
-          return plan;
-        }
+        // Advance one civil day to the next morning wake time.
+        planned_mode = "alarm";
+        WallTime next_day = now_local;
+        next_day.day += 1;
         next_day.hour = cfg.wake_hour;
         next_day.minute = cfg.wake_minute;
         next_day.second = 0;
-        if (!cal.local_to_epoch(next_day, target_epoch)) {
+        if (!normalize_civil_datetime(next_day) || !cal.local_to_epoch(next_day, target_epoch)) {
           return plan;
         }
       }
@@ -290,7 +316,7 @@ inline SchedulePlan plan_next_wake(const CalendarPort &cal, int64_t now_epoch,
       target_epoch = cand_epoch;
     }
   } else {
-    plan.mode = "alarm";
+    planned_mode = "alarm";
 
     WallTime wake_local = now_local;
     wake_local.hour = cfg.wake_hour;
@@ -303,14 +329,13 @@ inline SchedulePlan plan_next_wake(const CalendarPort &cal, int64_t now_epoch,
     }
 
     if (wake_epoch <= now_epoch) {
-      WallTime next_day {};
-      if (!cal.epoch_to_local(wake_epoch + 86400, next_day)) {
-        return plan;
-      }
+      // Advance one civil day to avoid DST 23-hour and 25-hour shift errors.
+      WallTime next_day = now_local;
+      next_day.day += 1;
       next_day.hour = cfg.wake_hour;
       next_day.minute = cfg.wake_minute;
       next_day.second = 0;
-      if (!cal.local_to_epoch(next_day, target_epoch)) {
+      if (!normalize_civil_datetime(next_day) || !cal.local_to_epoch(next_day, target_epoch)) {
         return plan;
       }
     } else {
@@ -319,12 +344,17 @@ inline SchedulePlan plan_next_wake(const CalendarPort &cal, int64_t now_epoch,
   }
 
   const int64_t diff = target_epoch - now_epoch;
+  if (diff <= 0 || diff > static_cast<int64_t>(UINT32_MAX)) {
+    return plan;
+  }
+
+  plan.mode = planned_mode;
   plan.target_epoch = target_epoch;
-  plan.sleep_seconds = static_cast<uint32_t>(diff > 0 ? diff : 0);
+  plan.sleep_seconds = static_cast<uint32_t>(diff);
   plan.clock_valid = true;
   plan.arm_alarm = false;
 
-  if (diff >= cfg.min_alarm_lead_sec && diff < cfg.max_alarm_lead_sec) {
+  if (diff >= min_alarm_lead && diff < max_alarm_lead) {
     WallTime target_utc {};
     if (cal.epoch_to_utc(target_epoch, target_utc)) {
       plan.arm_alarm = true;
@@ -339,11 +369,14 @@ inline SchedulePlan plan_next_wake(const CalendarPort &cal, int64_t now_epoch,
 inline SchedulePlan revalidate_before_sleep(const CalendarPort &cal, int64_t now_epoch,
                                             const SchedulePlan &plan,
                                             const ScheduleConfig &cfg = {}) {
+  const uint32_t fallback_sec = std::max(cfg.fallback_sleep_sec, MIN_FALLBACK_SLEEP_SEC);
+
   if (now_epoch <= 0) {
     SchedulePlan fallback;
-    fallback.mode = plan.mode;
+    fallback.mode = plan.mode != nullptr ? plan.mode : "timer";
     fallback.target_epoch = 0;
-    fallback.sleep_seconds = plan.sleep_seconds > 0 ? plan.sleep_seconds : cfg.fallback_sleep_sec;
+    fallback.sleep_seconds =
+        plan.sleep_seconds >= MIN_FALLBACK_SLEEP_SEC ? plan.sleep_seconds : fallback_sec;
     fallback.clock_valid = false;
     fallback.arm_alarm = false;
     return fallback;
@@ -353,8 +386,11 @@ inline SchedulePlan revalidate_before_sleep(const CalendarPort &cal, int64_t now
     return plan_next_wake(cal, now_epoch, cfg);
   }
 
+  const int min_alarm_lead = std::max(cfg.min_alarm_lead_sec, 0);
+  const int max_alarm_lead = std::max(cfg.max_alarm_lead_sec, min_alarm_lead);
+
   const int64_t remaining = plan.target_epoch - now_epoch;
-  if (remaining < cfg.min_alarm_lead_sec) {
+  if (remaining <= 0 || remaining < min_alarm_lead || remaining > max_alarm_lead) {
     return plan_next_wake(cal, now_epoch, cfg);
   }
 
@@ -363,7 +399,7 @@ inline SchedulePlan revalidate_before_sleep(const CalendarPort &cal, int64_t now
   updated.clock_valid = true;
   updated.arm_alarm = false;
 
-  if (remaining >= cfg.min_alarm_lead_sec && remaining < cfg.max_alarm_lead_sec) {
+  if (remaining >= min_alarm_lead && remaining < max_alarm_lead) {
     WallTime target_utc {};
     if (cal.epoch_to_utc(updated.target_epoch, target_utc)) {
       updated.arm_alarm = true;
@@ -385,7 +421,7 @@ inline SchedulePlan revalidate_before_sleep(const CalendarPort &cal, int64_t now
 
 namespace brd_schedule {
 
-// Calendar adapter that uses the parsed ESPHome global timezone.
+// Convert timestamps using the global ESPHome timezone.
 class EspHomeTzCalendar : public CalendarPort {
  public:
   bool epoch_to_local(int64_t epoch, LocalTime &out) const override {
@@ -426,6 +462,9 @@ class EspHomeTzCalendar : public CalendarPort {
   }
 
   bool epoch_to_utc(int64_t epoch, LocalTime &out) const override {
+    if (epoch < 0) {
+      return false;
+    }
     const time_t t = static_cast<time_t>(epoch);
     struct tm tm_buf {};
     if (gmtime_r(&t, &tm_buf) == nullptr) {

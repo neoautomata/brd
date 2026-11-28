@@ -5,11 +5,13 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -29,18 +31,27 @@ const (
 	shutdownTimeout   = 10 * time.Second
 )
 
+type regenRunner interface {
+	Regenerate(ctx context.Context, dateStr string) error
+	CleanupOldFiles(now time.Time)
+}
+
 func main() {
-	if err := run(); err != nil {
+	if err := run(os.Args[1:], os.Getenv, os.Stderr); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return
+		}
 		log.Printf("Fatal: %v", err)
 		os.Exit(1)
 	}
 }
 
-func run() error {
-	cfgFlag := flag.String("config", "", "Path to JSON configuration file")
-	flag.Parse()
+func run(args []string, getenv func(string) string, stderr io.Writer) error {
+	cfgPath, err := parseConfigPath(args, getenv, stderr)
+	if err != nil {
+		return err
+	}
 
-	cfgPath := resolveConfigPath(*cfgFlag)
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
 		return fmt.Errorf("load config %q: %w", cfgPath, err)
@@ -61,7 +72,7 @@ func run() error {
 		ClientSecretFile: cfg.ClientSecretFile(),
 	})
 	if err != nil {
-		log.Printf("Calendar service startup warning: %v", err)
+		log.Printf("Calendar startup warning: %v", err)
 	}
 	defer calSvc.Close()
 
@@ -77,18 +88,21 @@ func run() error {
 		},
 	)
 
-	captureSvc := capture.NewService(cfg, nil, nil)
-	defer func() {
-		if err := captureSvc.Close(); err != nil {
-			log.Printf("Stop browser driver failed: %v", err)
-		}
-	}()
-
-	localLn, err := net.Listen("tcp", cfg.LocalAddr)
-	if err != nil {
-		return fmt.Errorf("listen on local address %s: %w", cfg.LocalAddr, err)
+	browserFactory := &capture.ChromedpFactory{
+		ExecPath:  cfg.ChromePath,
+		NoSandbox: cfg.ChromeNoSandbox,
 	}
-	defer localLn.Close()
+	captureSvc := capture.NewService(cfg, browserFactory, nil)
+
+	var closeCaptureOnce sync.Once
+	closeCapture := func() {
+		closeCaptureOnce.Do(func() {
+			if err := captureSvc.Close(); err != nil {
+				log.Printf("Stop browser capture failed: %v", err)
+			}
+		})
+	}
+	defer closeCapture()
 
 	tsServer := &tsnet.Server{
 		Hostname: cfg.TailnetHostname,
@@ -111,35 +125,30 @@ func run() error {
 		return fmt.Errorf("create tailscale local client: %w", err)
 	}
 
+	// Open local_addr after tsnet starts so local connections do not stall during startup.
+	localLn, err := net.Listen("tcp", cfg.LocalAddr)
+	if err != nil {
+		return fmt.Errorf("listen on local address %s: %w", cfg.LocalAddr, err)
+	}
+	defer localLn.Close()
+
 	tsResolver := auth.TailscaleResolver{
 		Client:           lc,
 		TrustHeader:      cfg.TrustWebAuthHeader,
 		TrustedProxyTags: cfg.TrustedProxyTags,
 	}
-	tailnetAuth := auth.NewAuthorizer(cfg.AdminUsers, cfg.EditorUsers, tsResolver)
-	tailnetWeb := web.NewServer(web.Dependencies{
+	authorizer := auth.NewAuthorizer(cfg.AdminUsers, cfg.EditorUsers, tsResolver)
+	webSrv := web.NewServer(web.Dependencies{
 		Config:      cfg,
-		Authorizer:  tailnetAuth,
+		Authorizer:  authorizer,
 		Calendar:    calSvc,
 		Transit:     transitSvc,
 		Regenerator: captureSvc,
 	})
 
-	var localResolver auth.IdentityResolver = auth.TailscaleResolver{Client: lc}
-	if cfg.TrustWebAuthHeader {
-		localResolver = auth.HeaderResolver{}
-	}
-	localAuth := auth.NewAuthorizer(cfg.AdminUsers, cfg.EditorUsers, localResolver)
-	localWeb := web.NewServer(web.Dependencies{
-		Config:      cfg,
-		Authorizer:  localAuth,
-		Calendar:    calSvc,
-		Transit:     transitSvc,
-		Regenerator: captureSvc,
-	})
-
-	tailnetHTTP := newHTTPServer(tailnetWeb.Handler())
-	localHTTP := newHTTPServer(localWeb.Handler())
+	// Mount only read-only routes on local_addr so local clients cannot access edit or admin routes.
+	tailnetHTTP := newHTTPServer(rootCtx, webSrv.Handler())
+	localHTTP := newHTTPServer(rootCtx, webSrv.ReadOnlyHandler())
 
 	errChan := make(chan error, 2)
 	go func() {
@@ -165,7 +174,7 @@ func run() error {
 			case <-rootCtx.Done():
 				return
 			case <-regenTrigger:
-				runRegenCycle(rootCtx, cfg, captureSvc)
+				runRegenCycle(rootCtx, cfg.Location, time.Now(), captureSvc)
 			}
 		}
 	}()
@@ -177,28 +186,24 @@ func run() error {
 		}
 	}
 
-	// Queue initial image generation without blocking signal or startup error handling.
+	// Queue the initial image capture without blocking signals.
 	triggerRegen()
 
 	ticker := time.NewTicker(cfg.RegenInterval())
 	defer ticker.Stop()
 
-	log.Printf("Ready; regenerating images every %s", cfg.RegenInterval())
+	log.Printf("Server ready. Regenerating images every %s.", cfg.RegenInterval())
 	for {
 		select {
 		case <-rootCtx.Done():
-			log.Print("Shutdown signal received")
-			if err := captureSvc.Close(); err != nil {
-				log.Printf("Stop browser capture failed: %v", err)
-			}
+			log.Print("Server received shutdown signal.")
+			closeCapture()
 			regenWG.Wait()
 			shutdownServers(tailnetHTTP, localHTTP)
 			return nil
 		case srvErr := <-errChan:
 			stopSignals()
-			if err := captureSvc.Close(); err != nil {
-				log.Printf("Stop browser capture failed: %v", err)
-			}
+			closeCapture()
 			regenWG.Wait()
 			shutdownServers(tailnetHTTP, localHTTP)
 			return srvErr
@@ -208,18 +213,36 @@ func run() error {
 	}
 }
 
-func resolveConfigPath(flagVal string) string {
+func parseConfigPath(args []string, getenv func(string) string, stderr io.Writer) (string, error) {
+	fs := flag.NewFlagSet("brd", flag.ContinueOnError)
+	if stderr != nil {
+		fs.SetOutput(stderr)
+	}
+	cfgFlag := fs.String("config", "", "Path to JSON config file (defaults to BRD_CONFIG or config.json)")
+	if err := fs.Parse(args); err != nil {
+		return "", err
+	}
+	if fs.NArg() > 0 {
+		return "", fmt.Errorf("unexpected arguments: %s", strings.Join(fs.Args(), " "))
+	}
+	return resolveConfigPath(*cfgFlag, getenv), nil
+}
+
+func resolveConfigPath(flagVal string, getenv func(string) string) string {
 	if flagVal != "" {
 		return flagVal
 	}
-	if envVal := os.Getenv("BRD_CONFIG"); envVal != "" {
-		return envVal
+	if getenv != nil {
+		if envVal := getenv("BRD_CONFIG"); envVal != "" {
+			return envVal
+		}
 	}
 	return defaultConfigPath
 }
 
 func ensureDataDirs(cfg *config.Config) error {
 	dirs := []string{
+		cfg.DataDir,
 		cfg.ContentsDir(),
 		cfg.ScreenshotsDir(),
 		cfg.ImagesDir(),
@@ -229,29 +252,49 @@ func ensureDataDirs(cfg *config.Config) error {
 		if err := os.MkdirAll(dir, 0700); err != nil {
 			return err
 		}
+		info, err := os.Stat(dir)
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("path %q is not a directory", dir)
+		}
+		if info.Mode().Perm()&0077 != 0 {
+			if err := os.Chmod(dir, 0700); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }
 
-func newHTTPServer(handler http.Handler) *http.Server {
+func newHTTPServer(ctx context.Context, handler http.Handler) *http.Server {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	return &http.Server{
 		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      60 * time.Second,
 		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20,
+		BaseContext:       func(net.Listener) context.Context { return ctx },
 	}
 }
 
-func runRegenCycle(ctx context.Context, cfg *config.Config, captureSvc *capture.Service) {
+func runRegenCycle(ctx context.Context, loc *time.Location, now time.Time, runner regenRunner) {
 	if ctx.Err() != nil {
 		return
 	}
-	now := time.Now().In(cfg.Location)
-	today := now.Format("2006-01-02")
-	tomorrow := now.AddDate(0, 0, 1).Format("2006-01-02")
+	if loc == nil {
+		loc = time.UTC
+	}
+	localNow := now.In(loc)
+	today := localNow.Format("2006-01-02")
+	tomorrow := localNow.AddDate(0, 0, 1).Format("2006-01-02")
 
-	if err := captureSvc.Regenerate(ctx, today); err != nil {
+	if err := runner.Regenerate(ctx, today); err != nil {
 		if ctx.Err() != nil {
 			return
 		}
@@ -260,7 +303,7 @@ func runRegenCycle(ctx context.Context, cfg *config.Config, captureSvc *capture.
 	if ctx.Err() != nil {
 		return
 	}
-	if err := captureSvc.Regenerate(ctx, tomorrow); err != nil {
+	if err := runner.Regenerate(ctx, tomorrow); err != nil {
 		if ctx.Err() != nil {
 			return
 		}
@@ -269,11 +312,15 @@ func runRegenCycle(ctx context.Context, cfg *config.Config, captureSvc *capture.
 	if ctx.Err() != nil {
 		return
 	}
-	captureSvc.CleanupOldFiles(now)
+	runner.CleanupOldFiles(localNow)
 }
 
 func shutdownServers(servers ...*http.Server) {
-	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	shutdownServersWithTimeout(shutdownTimeout, servers...)
+}
+
+func shutdownServersWithTimeout(timeout time.Duration, servers ...*http.Server) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	var wg sync.WaitGroup
 	for _, srv := range servers {
@@ -284,9 +331,9 @@ func shutdownServers(servers ...*http.Server) {
 		go func(s *http.Server) {
 			defer wg.Done()
 			if err := s.Shutdown(ctx); err != nil {
-				log.Printf("HTTP server shutdown error: %v", err)
+				log.Printf("HTTP shutdown error: %v", err)
 				if closeErr := s.Close(); closeErr != nil {
-					log.Printf("HTTP server force close error: %v", closeErr)
+					log.Printf("HTTP force-close error: %v", closeErr)
 				}
 			}
 		}(srv)

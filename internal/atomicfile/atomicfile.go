@@ -1,12 +1,24 @@
 package atomicfile
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
-// Write persists data to path atomically using a synced temporary file, rename, and parent directory sync.
+// Write saves data to path atomically with a synced temporary file, rename, and directory sync.
 func Write(path string, data []byte, perm os.FileMode) error {
+	if strings.TrimSpace(path) == "" {
+		return errors.New("atomicfile: path is empty")
+	}
+	if strings.ContainsRune(path, '\x00') {
+		return errors.New("atomicfile: path contains null byte")
+	}
+	if strings.HasSuffix(path, string(os.PathSeparator)) || strings.HasSuffix(path, "/") {
+		return errors.New("atomicfile: path ends with a directory separator")
+	}
+
 	dir := filepath.Dir(path)
 	f, err := os.CreateTemp(dir, ".tmp-*")
 	if err != nil {
